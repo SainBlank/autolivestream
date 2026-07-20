@@ -142,7 +142,7 @@
         </div>
       </div>
     </div>
-    <div id="profile-dropdown" class="fixed bg-dark-800 shadow-xl border border-gray-700 hidden">
+    <div id="profile-dropdown" class="fixed bg-dark-800 shadow-xl border border-gray-700 rounded-lg w-56 z-50 hidden">
       <div class="px-4 py-2 border-b border-gray-700">
         <div class="font-medium">
           <%= helpers.getUsername(req) %>
@@ -203,4 +203,82 @@
           <div class="h-3 w-px bg-gray-700"></div>
           <a href="https://youtube.com/@SainBlank" target="_blank" class="text-xs text-gray-500 hover:underline">by
             SainBlank</a>
-          </script>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!--
+    Script UI global layout. Bagian ini HILANG saat porting (file layout.ejs
+    terpotong + ada </script> menggantung), sehingga dropdown profil (tombol
+    Sign Out) tidak muncul saat avatar diklik dan jam kanan atas mentok di
+    "--:--:--". Dipulihkan di sini.
+  -->
+  <script>
+    (function () {
+      // ===== Jam realtime timezone Asia/Jakarta (WIB) =====
+      var dateFmt = new Intl.DateTimeFormat('id-ID', {
+        timeZone: 'Asia/Jakarta', weekday: 'short', day: '2-digit', month: 'short'
+      });
+      var timeFmt = new Intl.DateTimeFormat('id-ID', {
+        timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+      });
+      function setText(id, text) { var el = document.getElementById(id); if (el) el.textContent = text; }
+      function tickClock() {
+        var now = new Date();
+        var d = dateFmt.format(now);
+        var t = timeFmt.format(now) + ' WIB';
+        setText('server-date', d);
+        setText('server-clock', t);
+        setText('mobile-server-date', d);
+        setText('mobile-server-clock', t);
+      }
+      tickClock();
+      setInterval(tickClock, 1000);
+      // tampilkan blok jam versi mobile
+      var mob = document.getElementById('mobile-server-time');
+      if (mob) { mob.classList.remove('hidden'); mob.classList.add('flex'); }
+
+      // ===== Dropdown profil (avatar kiri bawah) berisi Settings/Help/Sign Out =====
+      var profileBtn = document.getElementById('profile-menu-button');
+      var profileDropdown = document.getElementById('profile-dropdown');
+      function positionProfileDropdown() {
+        if (!profileBtn || !profileDropdown) return;
+        var r = profileBtn.getBoundingClientRect();
+        profileDropdown.style.left = (r.right + 8) + 'px';
+        profileDropdown.style.bottom = (window.innerHeight - r.bottom) + 'px';
+      }
+      if (profileBtn && profileDropdown) {
+        profileBtn.addEventListener('click', function (e) {
+          e.stopPropagation();
+          if (profileDropdown.classList.contains('hidden')) { positionProfileDropdown(); }
+          profileDropdown.classList.toggle('hidden');
+        });
+        document.addEventListener('click', function (e) {
+          if (!profileDropdown.contains(e.target) && !profileBtn.contains(e.target)) {
+            profileDropdown.classList.add('hidden');
+          }
+        });
+        window.addEventListener('resize', function () {
+          if (!profileDropdown.classList.contains('hidden')) positionProfileDropdown();
+        });
+      }
+
+      // ===== Toggle notifikasi (desktop) =====
+      var notifBtn = document.getElementById('notification-btn');
+      var notifDropdown = document.getElementById('notification-dropdown');
+      if (notifBtn && notifDropdown) {
+        notifBtn.addEventListener('click', function (e) {
+          e.stopPropagation();
+          notifDropdown.classList.toggle('hidden');
+        });
+        document.addEventListener('click', function (e) {
+          if (!notifDropdown.contains(e.target) && !notifBtn.contains(e.target)) {
+            notifDropdown.classList.add('hidden');
+          }
+        });
+      }
+    })();
+  </script>
+</body>
+</html>
