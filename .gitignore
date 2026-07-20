@@ -1,0 +1,11 @@
+node_modules/
+.env
+logs/*
+public/uploads/*
+
+# File DATA database - jangan di-commit
+db/*.db
+db/*.sqlite
+db/*.sqlite3
+
+# TAPI kode db/database.js TETAP di-track (jangan diabaikan)
