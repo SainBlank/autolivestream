@@ -424,7 +424,8 @@ router.get('/history', isAuthenticated, async (req, res) => {
       active: 'history',
       title: 'Stream History',
       history: history,
-      helpers: app.locals.helpers,
+      // helpers TIDAK perlu dioper di sini: sudah tersedia global lewat app.locals.helpers (app.js).
+      // Baris lama `helpers: app.locals.helpers` bikin "app is not defined" karena `app` tidak ada di file router ini.
       pagination: {
         page,
         limit,
