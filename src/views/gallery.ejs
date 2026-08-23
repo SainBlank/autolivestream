@@ -68,6 +68,28 @@
   </div>
   <% } %>
 
+  <!-- Kolom drop upload (selalu tampil) -->
+  <div class="mb-6">
+    <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-3">Upload Video</h2>
+    <div id="inlineDropZone" class="bg-dark-800 border-2 border-dashed border-gray-600 rounded-xl p-8 text-center cursor-pointer hover:border-primary transition-colors">
+      <i class="ti ti-cloud-upload text-4xl text-gray-500"></i>
+      <p class="mt-2 text-sm text-gray-300">Tarik &amp; lepas file video ke sini, atau klik untuk memilih</p>
+      <p class="mt-1 text-xs text-gray-500">MP4, AVI, MOV &middot; file besar didukung (upload bertahap, bisa dilanjutkan)</p>
+      <input type="file" id="inlineFileInput" accept=".mp4,.avi,.mov,video/mp4,video/x-msvideo,video/quicktime" multiple class="hidden">
+    </div>
+    <div class="mt-3 flex flex-col sm:flex-row sm:items-center gap-2">
+      <label for="inlineFolderSelect" class="text-xs text-gray-400 shrink-0">Folder tujuan</label>
+      <select id="inlineFolderSelect" class="bg-dark-700 border border-gray-700 rounded-lg px-3 py-2 text-sm">
+        <option value="">Root (tanpa folder)</option>
+        <% (folders || []).forEach(function(folder) { %>
+        <option value="<%= folder.id %>" <%= (typeof currentFolderId !== 'undefined' && currentFolderId === folder.id) ? 'selected' : '' %>><%= folder.name %></option>
+        <% }); %>
+      </select>
+    </div>
+    <div class="js-upload-error hidden mt-3 text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg p-3 whitespace-pre-wrap break-words"></div>
+    <div id="inlineProgressList" class="mt-3 space-y-2"></div>
+  </div>
+
   <!-- Videos -->
   <div>
     <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-3">Videos</h2>
@@ -286,6 +308,38 @@
       if (anySuccess) location.reload();
     }
 
+    function showUploadError(message) {
+      var boxes = document.querySelectorAll('.js-upload-error');
+      if (!boxes.length) {
+        alert(message);
+        return;
+      }
+      Array.prototype.forEach.call(boxes, function (box) {
+        box.textContent = message;
+        box.classList.remove('hidden');
+      });
+    }
+
+    function clearUploadError() {
+      var boxes = document.querySelectorAll('.js-upload-error');
+      Array.prototype.forEach.call(boxes, function (box) {
+        box.textContent = '';
+        box.classList.add('hidden');
+      });
+    }
+
+    async function readJson(res, tag) {
+      var text = await res.text();
+      try {
+        return JSON.parse(text);
+      } catch (parseError) {
+        if (res.status === 401 || res.status === 403 || /<html/i.test(text)) {
+          throw new Error('Sesi login sudah habis (HTTP ' + res.status + '). Refresh halaman ini lalu login ulang.');
+        }
+        throw new Error('Server membalas bukan JSON pada tahap "' + tag + '" (HTTP ' + res.status + '): ' + text.slice(0, 200));
+      }
+    }
+
     function formatBytes(b) {
       if (!b || isNaN(b)) return '0 B';
       var units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -293,7 +347,7 @@
       return (b / Math.pow(1024, i)).toFixed(1) + ' ' + units[i];
     }
 
-    function makeRow(file) {
+    function makeRow(file, container) {
       var wrap = document.createElement('div');
       wrap.className = 'bg-dark-900 rounded-lg p-3';
 
@@ -321,7 +375,8 @@
 
       wrap.appendChild(top);
       wrap.appendChild(barWrap);
-      listEl.appendChild(wrap);
+      var target = container || listEl;
+      if (target) target.appendChild(wrap);
 
       return { bar: bar, status: status };
     }
@@ -339,14 +394,14 @@
       return false;
     }
 
-    function addFiles(files) {
+    function addFiles(files, container) {
       for (var i = 0; i < files.length; i++) {
         var file = files[i];
         if (!isAllowed(file)) {
           alert('Format tidak didukung: ' + file.name + '\nHanya MP4, AVI, dan MOV.');
           continue;
         }
-        queue.push({ file: file, row: makeRow(file), done: false });
+        queue.push({ file: file, row: makeRow(file, container), done: false });
       }
     }
 
@@ -368,7 +423,7 @@
         })
       });
 
-      var initData = await initRes.json();
+      var initData = await readJson(initRes, 'init');
 
       if (!initData.success) {
         throw new Error(initData.error || 'Gagal memulai upload');
@@ -408,7 +463,7 @@
           body: blob
         });
 
-        var chunkData = await chunkRes.json();
+        var chunkData = await readJson(chunkRes, 'chunk ' + i);
 
         if (!chunkData.success) {
           throw new Error(chunkData.error || 'Gagal mengunggah bagian file');
@@ -426,7 +481,7 @@
         body: JSON.stringify({ uploadId: initData.uploadId })
       });
 
-      var doneData = await doneRes.json();
+      var doneData = await readJson(doneRes, 'complete');
 
       if (!doneData.success) {
         throw new Error(doneData.error || 'Gagal menyelesaikan upload');
@@ -457,7 +512,7 @@
           console.error('Upload error:', error);
           pending[i].row.status.textContent = 'Gagal';
           pending[i].row.status.className = 'text-xs text-red-400 shrink-0';
-          alert('Upload gagal: ' + error.message);
+          showUploadError('Upload gagal (' + pending[i].file.name + '): ' + error.message);
         }
       }
 
@@ -504,7 +559,60 @@
       if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
     });
 
-    startBtn.addEventListener('click', runQueue);
+    if (startBtn) startBtn.addEventListener('click', runQueue);
+
+    // ===== Kolom drop upload di halaman Gallery =====
+    var inlineZone = document.getElementById('inlineDropZone');
+    var inlineInput = document.getElementById('inlineFileInput');
+    var inlineList = document.getElementById('inlineProgressList');
+    var inlineFolder = document.getElementById('inlineFolderSelect');
+
+    function handleInlineFiles(files) {
+      if (busy) {
+        showUploadError('Masih ada upload yang berjalan. Tunggu sampai selesai.');
+        return;
+      }
+      clearUploadError();
+      if (inlineFolder && folderSelect) folderSelect.value = inlineFolder.value;
+      addFiles(files, inlineList);
+      runQueue();
+    }
+
+    if (inlineZone && inlineInput) {
+      inlineZone.addEventListener('click', function () { inlineInput.click(); });
+
+      inlineInput.addEventListener('change', function () {
+        handleInlineFiles(inlineInput.files);
+        inlineInput.value = '';
+      });
+
+      ['dragenter', 'dragover'].forEach(function (evt) {
+        inlineZone.addEventListener(evt, function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          inlineZone.classList.add('border-primary');
+        });
+      });
+
+      ['dragleave', 'drop'].forEach(function (evt) {
+        inlineZone.addEventListener(evt, function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          inlineZone.classList.remove('border-primary');
+        });
+      });
+
+      inlineZone.addEventListener('drop', function (e) {
+        if (e.dataTransfer && e.dataTransfer.files) handleInlineFiles(e.dataTransfer.files);
+      });
+    }
+
+    ['dragover', 'drop'].forEach(function (evt) {
+      document.addEventListener(evt, function (e) {
+        if (e.target && e.target.closest && e.target.closest('#inlineDropZone, #uploadDropZone')) return;
+        e.preventDefault();
+      });
+    });
 
     window.addEventListener('beforeunload', function (e) {
       if (busy) {
