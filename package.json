@@ -1,6 +1,6 @@
 {
   "name": "autolivestream",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "Live streaming app with multi-platform support",
   "main": "app.js",
   "scripts": {

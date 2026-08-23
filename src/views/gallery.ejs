@@ -1,19 +1,26 @@
 <% layout('layout') -%>
 <%#
   src/views/gallery.ejs
-  FILE BARU: view gallery hilang saat porting dari StreamFire -> "Failed to lookup view gallery".
-  Dibangun ulang sesuai data dari route GET /gallery (userRoutes.js:173):
+
+  UI upload dipulihkan 1:1 dari StreamFlow asli (views/gallery.ejs), yang hilang
+  saat porting ke struktur src/. Arsitektur upload mengikuti aslinya:
+    - Tab Video / Audio
+    - Video <= 50MB  -> POST /api/videos/upload        (FormData field "video", XHR progress)
+    - Video >  50MB  -> POST /api/videos/chunk/init -> /chunk/upload -> /chunk/complete
+                        (potongan 50MB, 3x retry per potongan, resume via uploadedChunks)
+    - Audio          -> POST /api/audio/upload        (FormData field "audio")
+    - Impor cloud    -> /api/videos/import-{drive,mediafire,dropbox,mega}
+                        + polling /api/videos/import-status/:jobId
+    - Kuota disk     -> GET /api/user/disk-usage (cek sebelum upload)
+  Tambahan dari versi asli: dropzone selalu tampil (tidak disembunyikan di modal)
+  dan daftar video disegarkan tanpa reload halaman.
+
+  Data dari route GET /gallery (userRoutes.js):
     title, active, user, videos, folders, currentFolder, currentFolderId
-  Memakai endpoint API yang sudah ada:
-    POST   /api/media-folders            { name }
-    PUT    /api/media-folders/:id         { name }
-    DELETE /api/media-folders/:id
-    PUT    /api/videos/:id/folder         { folderId }
-    DELETE /api/videos/:id
-  Catatan: aksi memakai data-* attribute + event listener (bukan inline onclick)
-  supaya aman dari masalah escaping tanda kutip pada nama file/folder.
 -%>
 <div class="max-w-7xl mx-auto">
+  <input type="hidden" id="galleryCsrf" value="<%= typeof csrfToken !== 'undefined' ? csrfToken : '' %>">
+
   <!-- Header -->
   <div class="flex flex-wrap items-center justify-between gap-4 mb-6">
     <div>
@@ -27,71 +34,153 @@
       </div>
     </div>
     <div class="flex items-center gap-2">
+      <span id="diskUsageText" class="hidden sm:inline text-xs text-gray-400 mr-1"></span>
       <% if (!currentFolderId) { %>
-      <button id="btnNewFolder" class="flex items-center gap-2 px-4 py-2 rounded-lg bg-dark-700 hover:bg-dark-600 text-sm transition-colors">
+      <button type="button" id="btnNewFolder" class="flex items-center gap-2 px-4 py-2 rounded-lg bg-dark-700 hover:bg-dark-600 text-sm transition-colors">
         <i class="ti ti-folder-plus"></i> New Folder
       </button>
       <% } %>
-      <button type="button" id="btnUploadVideo" class="js-open-upload flex items-center gap-2 px-4 py-2 rounded-lg bg-primary hover:opacity-90 text-sm transition-colors">
-        <i class="ti ti-upload"></i> Upload Video
+      <div class="relative">
+        <button type="button" id="btnCloudDropdown" class="flex items-center gap-2 px-4 py-2 rounded-lg bg-dark-700 hover:bg-dark-600 text-sm transition-colors">
+          <i class="ti ti-cloud-download"></i> Impor Cloud
+          <i class="ti ti-chevron-down text-xs"></i>
+        </button>
+        <div id="cloudDropdown" class="hidden absolute right-0 mt-2 w-56 bg-dark-800 border border-gray-700 rounded-lg shadow-xl z-40 py-1">
+          <button type="button" class="js-cloud-open w-full flex items-center gap-3 px-4 py-2 text-sm hover:bg-dark-700 text-left" data-type="gdrive">
+            <img src="/images/google drive.png" alt="" class="w-5 h-5"> Google Drive
+          </button>
+          <button type="button" class="js-cloud-open w-full flex items-center gap-3 px-4 py-2 text-sm hover:bg-dark-700 text-left" data-type="mediafire">
+            <img src="/images/mediafire.png" alt="" class="w-5 h-5"> MediaFire
+          </button>
+          <button type="button" class="js-cloud-open w-full flex items-center gap-3 px-4 py-2 text-sm hover:bg-dark-700 text-left" data-type="dropbox">
+            <img src="/images/dropbox.png" alt="" class="w-5 h-5"> Dropbox
+          </button>
+          <button type="button" class="js-cloud-open w-full flex items-center gap-3 px-4 py-2 text-sm hover:bg-dark-700 text-left" data-type="mega">
+            <img src="/images/mega.png" alt="" class="w-5 h-5"> MEGA
+          </button>
+        </div>
+      </div>
+      <button type="button" class="js-focus-upload flex items-center gap-2 px-4 py-2 rounded-lg bg-primary hover:opacity-90 text-sm transition-colors">
+        <i class="ti ti-upload"></i> Upload Media
       </button>
     </div>
   </div>
 
-  <!-- Folders (hanya di root) -->
-  <% if (!currentFolderId && folders && folders.length > 0) { %>
-  <div class="mb-8">
-    <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-3">Folders</h2>
-    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
-      <% folders.forEach(function(folder) { %>
-      <div class="group relative bg-dark-800 border border-gray-700 rounded-xl p-4 hover:border-primary transition-colors">
-        <a href="/gallery?folder=<%= encodeURIComponent(folder.id) %>" class="flex items-center gap-3">
-          <div class="w-10 h-10 rounded-lg bg-dark-700 flex items-center justify-center flex-shrink-0">
-            <i class="ti ti-folder text-xl text-primary"></i>
+  <!-- Folders -->
+  <div id="foldersSection">
+    <% if (!currentFolderId && folders && folders.length > 0) { %>
+    <div class="mb-8">
+      <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-3">Folders</h2>
+      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+        <% folders.forEach(function(folder) { %>
+        <div class="group relative bg-dark-800 border border-gray-700 rounded-xl p-4 hover:border-primary transition-colors">
+          <a href="/gallery?folder=<%= encodeURIComponent(folder.id) %>" class="flex items-center gap-3">
+            <div class="w-10 h-10 rounded-lg bg-dark-700 flex items-center justify-center flex-shrink-0">
+              <i class="ti ti-folder text-xl text-primary"></i>
+            </div>
+            <div class="min-w-0">
+              <div class="font-medium truncate"><%= folder.name %></div>
+              <div class="text-xs text-gray-400"><%= folder.item_count || 0 %> item</div>
+            </div>
+          </a>
+          <div class="absolute top-2 right-2 hidden group-hover:flex items-center gap-1">
+            <button class="js-rename-folder p-1.5 rounded-lg hover:bg-dark-700 text-gray-400 hover:text-white" data-id="<%= folder.id %>" data-name="<%= folder.name %>" title="Rename">
+              <i class="ti ti-pencil text-sm"></i>
+            </button>
+            <button class="js-delete-folder p-1.5 rounded-lg hover:bg-dark-700 text-gray-400 hover:text-red-400" data-id="<%= folder.id %>" data-name="<%= folder.name %>" title="Delete">
+              <i class="ti ti-trash text-sm"></i>
+            </button>
           </div>
-          <div class="min-w-0">
-            <div class="font-medium truncate"><%= folder.name %></div>
-            <div class="text-xs text-gray-400"><%= folder.item_count || 0 %> item</div>
+        </div>
+        <% }); %>
+      </div>
+    </div>
+    <% } %>
+  </div>
+
+  <!-- Upload media (selalu tampil) -->
+  <div class="mb-8" id="uploadCard">
+    <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-3">Upload Media</h2>
+    <div class="bg-dark-800 border border-gray-700 rounded-xl p-5">
+      <div class="flex gap-2 mb-4">
+        <button type="button" id="tabVideo" class="flex-1 py-2 px-4 rounded-lg bg-primary text-white text-sm transition-colors">
+          <i class="ti ti-video mr-2"></i>Video
+        </button>
+        <button type="button" id="tabAudio" class="flex-1 py-2 px-4 rounded-lg bg-dark-700 text-gray-400 hover:text-white text-sm transition-colors">
+          <i class="ti ti-music mr-2"></i>Audio
+        </button>
+      </div>
+
+      <div id="uploadDropzone" class="border-2 border-dashed border-gray-600 hover:border-primary rounded-lg py-10 px-6 text-center transition-all cursor-pointer">
+        <div class="flex flex-col items-center justify-center space-y-3">
+          <div class="w-14 h-14 rounded-full bg-dark-700 flex items-center justify-center">
+            <i id="dropzoneIcon" class="ti ti-cloud-upload text-2xl text-gray-400"></i>
           </div>
-        </a>
-        <div class="absolute top-2 right-2 hidden group-hover:flex items-center gap-1">
-          <button class="js-rename-folder p-1.5 rounded-lg hover:bg-dark-700 text-gray-400 hover:text-white" data-id="<%= folder.id %>" data-name="<%= folder.name %>" title="Rename">
-            <i class="ti ti-pencil text-sm"></i>
-          </button>
-          <button class="js-delete-folder p-1.5 rounded-lg hover:bg-dark-700 text-gray-400 hover:text-red-400" data-id="<%= folder.id %>" data-name="<%= folder.name %>" title="Delete">
-            <i class="ti ti-trash text-sm"></i>
-          </button>
+          <div>
+            <p id="dropzoneText" class="text-gray-300">Tarik &amp; lepas file video ke sini</p>
+            <p class="text-gray-500 text-sm">atau klik untuk memilih</p>
+          </div>
+          <p id="dropzoneFormats" class="text-gray-500 text-xs">Format: MP4, AVI, MOV (maks 50GB)</p>
+        </div>
+        <input type="file" id="mediaFileInput" accept="video/mp4,video/avi,video/quicktime,.mp4,.avi,.mov" multiple class="hidden">
+      </div>
+
+      <div class="mt-3 flex flex-col sm:flex-row sm:items-center gap-2">
+        <label for="uploadFolderSelect" class="text-xs text-gray-400 shrink-0">Folder tujuan</label>
+        <select id="uploadFolderSelect" class="bg-dark-700 border border-gray-700 rounded-lg px-3 py-2 text-sm">
+          <option value="">Root (tanpa folder)</option>
+          <% (folders || []).forEach(function(folder) { %>
+          <option value="<%= folder.id %>" <%= (currentFolderId && currentFolderId === folder.id) ? 'selected' : '' %>><%= folder.name %></option>
+          <% }); %>
+        </select>
+      </div>
+
+      <div id="selectedFileInfo" class="hidden mt-4">
+        <div class="bg-dark-700 p-4 rounded-lg">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-3">
+              <div class="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center">
+                <i class="ti ti-files text-primary"></i>
+              </div>
+              <div>
+                <p class="font-medium text-sm">File terpilih</p>
+                <p id="selectedFileCount" class="text-xs text-gray-400"></p>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <button type="button" id="addMoreFiles" class="text-primary hover:text-blue-400 text-sm">Tambah file</button>
+              <button type="button" id="clearFileButton" class="text-gray-400 hover:text-white p-1">
+                <i class="ti ti-x"></i>
+              </button>
+            </div>
+          </div>
+          <div id="selectedFilesList" class="space-y-2 max-h-48 overflow-y-auto"></div>
         </div>
       </div>
-      <% }); %>
-    </div>
-  </div>
-  <% } %>
 
-  <!-- Kolom drop upload (selalu tampil) -->
-  <div class="mb-6">
-    <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-3">Upload Video</h2>
-    <div id="inlineDropZone" class="bg-dark-800 border-2 border-dashed border-gray-600 rounded-xl p-8 text-center cursor-pointer hover:border-primary transition-colors">
-      <i class="ti ti-cloud-upload text-4xl text-gray-500"></i>
-      <p class="mt-2 text-sm text-gray-300">Tarik &amp; lepas file video ke sini, atau klik untuk memilih</p>
-      <p class="mt-1 text-xs text-gray-500">MP4, AVI, MOV &middot; file besar didukung (upload bertahap, bisa dilanjutkan)</p>
-      <input type="file" id="inlineFileInput" accept=".mp4,.avi,.mov,video/mp4,video/x-msvideo,video/quicktime" multiple class="hidden">
+      <div id="uploadProgress" class="hidden mt-4">
+        <div class="flex justify-between items-center text-sm mb-2">
+          <span id="uploadProgressStatus" class="text-gray-400 truncate mr-2">Mengunggah...</span>
+          <span id="uploadProgressPercent" class="text-primary font-medium">0%</span>
+        </div>
+        <div class="w-full bg-dark-700 rounded-full h-2.5">
+          <div id="uploadProgressBar" class="bg-primary h-2.5 rounded-full transition-all duration-300" style="width: 0%"></div>
+        </div>
+        <div id="uploadFilesList" class="mt-3 space-y-2 max-h-48 overflow-y-auto"></div>
+      </div>
+
+      <div id="uploadErrorBox" class="hidden mt-3 text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg p-3 whitespace-pre-wrap break-words"></div>
+
+      <div class="flex justify-end mt-4">
+        <button type="button" id="uploadButton" class="px-4 py-2 bg-primary hover:opacity-90 text-white text-sm rounded-lg transition-colors disabled:bg-gray-600 disabled:cursor-not-allowed" disabled>
+          <i class="ti ti-upload mr-1.5"></i>Mulai Upload
+        </button>
+      </div>
     </div>
-    <div class="mt-3 flex flex-col sm:flex-row sm:items-center gap-2">
-      <label for="inlineFolderSelect" class="text-xs text-gray-400 shrink-0">Folder tujuan</label>
-      <select id="inlineFolderSelect" class="bg-dark-700 border border-gray-700 rounded-lg px-3 py-2 text-sm">
-        <option value="">Root (tanpa folder)</option>
-        <% (folders || []).forEach(function(folder) { %>
-        <option value="<%= folder.id %>" <%= (typeof currentFolderId !== 'undefined' && currentFolderId === folder.id) ? 'selected' : '' %>><%= folder.name %></option>
-        <% }); %>
-      </select>
-    </div>
-    <div class="js-upload-error hidden mt-3 text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg p-3 whitespace-pre-wrap break-words"></div>
-    <div id="inlineProgressList" class="mt-3 space-y-2"></div>
   </div>
 
   <!-- Videos -->
-  <div>
+  <div id="videosSection">
     <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-3">Videos</h2>
     <% if (videos && videos.length > 0) { %>
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
@@ -99,7 +188,7 @@
       <div class="group bg-dark-800 border border-gray-700 rounded-xl overflow-hidden hover:border-primary transition-colors">
         <div class="relative aspect-video bg-dark-700 overflow-hidden">
           <% if (video.thumbnail_path) { %>
-            <img src="<%= video.thumbnail_path %>" class="w-full h-full object-cover" onerror="this.src='/images/default-thumbnail.jpg'">
+            <img src="<%= video.thumbnail_path %>" class="w-full h-full object-cover" onerror="this.src='/images/default-video-thumbnail.svg'">
           <% } else { %>
             <div class="w-full h-full flex items-center justify-center">
               <i class="ti ti-video text-3xl text-gray-500"></i>
@@ -116,10 +205,10 @@
             <span data-filesize="<%= video.file_size || 0 %>"></span>
           </div>
           <div class="flex items-center justify-end gap-1 mt-2">
-            <button class="js-move-video p-1.5 rounded-lg hover:bg-dark-700 text-gray-400 hover:text-white" data-id="<%= video.id %>" title="Move to folder">
+            <button class="js-move-video p-1.5 rounded-lg hover:bg-dark-700 text-gray-400 hover:text-white" data-id="<%= video.id %>" title="Pindah folder">
               <i class="ti ti-folder-symlink text-sm"></i>
             </button>
-            <button class="js-delete-video p-1.5 rounded-lg hover:bg-dark-700 text-gray-400 hover:text-red-400" data-id="<%= video.id %>" data-title="<%= video.title %>" title="Delete">
+            <button class="js-delete-video p-1.5 rounded-lg hover:bg-dark-700 text-gray-400 hover:text-red-400" data-id="<%= video.id %>" data-title="<%= video.title %>" title="Hapus">
               <i class="ti ti-trash text-sm"></i>
             </button>
           </div>
@@ -131,410 +220,720 @@
     <div class="flex flex-col items-center justify-center py-16 text-center">
       <i class="ti ti-photo-off text-4xl text-gray-600 mb-3"></i>
       <p class="text-gray-400">Belum ada video di sini.</p>
-      <button type="button" class="js-open-upload mt-3 text-primary text-sm hover:underline">Upload video sekarang</button>
+      <button type="button" class="js-focus-upload mt-3 text-primary text-sm hover:underline">Upload video sekarang</button>
     </div>
     <% } %>
-  </div>
-</div>
-
-<!-- Upload video modal -->
-<div id="uploadModal" class="fixed inset-0 bg-black/60 z-50 hidden items-center justify-center p-4">
-  <div class="bg-dark-800 border border-gray-700 rounded-xl w-full max-w-lg p-5">
-    <div class="flex items-center justify-between mb-4">
-      <h3 class="font-semibold">Upload Video</h3>
-      <button type="button" id="uploadCloseBtn" class="text-gray-400 hover:text-white">
-        <i class="ti ti-x"></i>
-      </button>
-    </div>
-
-    <div id="uploadDropZone" class="border-2 border-dashed border-gray-600 rounded-lg p-6 text-center cursor-pointer hover:border-primary transition-colors">
-      <i class="ti ti-cloud-upload text-3xl text-gray-500"></i>
-      <p class="text-sm text-gray-300 mt-2">Tarik file ke sini atau <span class="text-primary">klik untuk pilih file</span></p>
-      <p class="text-xs text-gray-500 mt-1">Format: MP4, AVI, MOV &middot; file besar didukung (upload bertahap 50 MB)</p>
-      <input type="file" id="uploadFileInput" accept=".mp4,.avi,.mov,video/mp4,video/x-msvideo,video/quicktime" multiple class="hidden">
-    </div>
-
-    <div class="mt-4">
-      <label class="text-xs text-gray-400 block mb-1">Simpan ke folder</label>
-      <select id="uploadFolderSelect" class="w-full bg-dark-700 border border-gray-700 rounded-lg px-3 py-2 text-sm">
-        <option value="">Root (tanpa folder)</option>
-        <% (folders || []).forEach(function(folder) { %>
-        <option value="<%= folder.id %>" <%= (typeof currentFolderId !== 'undefined' && currentFolderId === folder.id) ? 'selected' : '' %>><%= folder.name %></option>
-        <% }); %>
-      </select>
-    </div>
-
-    <div id="uploadProgressList" class="mt-4 space-y-2 max-h-52 overflow-y-auto"></div>
-
-    <div class="flex justify-end gap-2 mt-5">
-      <button type="button" id="uploadCancelBtn" class="px-4 py-2 rounded-lg bg-dark-700 hover:bg-dark-600 text-sm">Tutup</button>
-      <button type="button" id="uploadStartBtn" class="px-4 py-2 rounded-lg bg-primary hover:opacity-90 text-sm">Mulai Upload</button>
-    </div>
   </div>
 </div>
 
 <!-- Move-to-folder modal -->
 <div id="moveModal" class="fixed inset-0 bg-black/60 z-50 hidden items-center justify-center p-4">
   <div class="bg-dark-800 border border-gray-700 rounded-xl w-full max-w-sm p-5">
-    <h3 class="font-semibold mb-3">Move video to folder</h3>
-    <select id="moveFolderSelect" class="w-full bg-dark-700 border border-gray-700 rounded-lg px-3 py-2 text-sm mb-4">
-      <option value="">Root (no folder)</option>
+    <h3 class="font-semibold mb-3">Pindahkan ke folder</h3>
+    <select id="moveFolderSelect" class="w-full bg-dark-700 border border-gray-700 rounded-lg px-3 py-2 text-sm">
+      <option value="">Root (tanpa folder)</option>
       <% (folders || []).forEach(function(folder) { %>
       <option value="<%= folder.id %>"><%= folder.name %></option>
       <% }); %>
     </select>
-    <div class="flex justify-end gap-2">
-      <button id="moveCancel" class="px-4 py-2 rounded-lg bg-dark-700 hover:bg-dark-600 text-sm">Cancel</button>
-      <button id="moveConfirm" class="px-4 py-2 rounded-lg bg-primary hover:opacity-90 text-sm">Move</button>
+    <div class="flex justify-end gap-2 mt-4">
+      <button type="button" id="moveCancel" class="px-4 py-2 rounded-lg bg-dark-700 hover:bg-dark-600 text-sm">Batal</button>
+      <button type="button" id="moveConfirm" class="px-4 py-2 rounded-lg bg-primary hover:opacity-90 text-sm">Pindahkan</button>
     </div>
   </div>
 </div>
 
-<script>
-  (function () {
-    // Format ukuran file di client
-    document.querySelectorAll('[data-filesize]').forEach(function (el) {
-      var b = parseInt(el.getAttribute('data-filesize'), 10);
-      if (!b || isNaN(b)) { el.textContent = ''; return; }
-      var units = ['B', 'KB', 'MB', 'GB', 'TB'];
-      var i = Math.floor(Math.log(b) / Math.log(1024));
-      el.textContent = (b / Math.pow(1024, i)).toFixed(1) + ' ' + units[i];
-    });
+<!-- Cloud import modal -->
+<div id="cloudImportModal" class="fixed inset-0 bg-black/60 z-50 hidden items-center justify-center p-4">
+  <div class="bg-dark-800 border border-gray-700 rounded-xl w-full max-w-md">
+    <div class="flex items-center justify-between p-4 border-b border-gray-700">
+      <h3 id="cloudModalTitle" class="font-semibold">Impor dari Cloud</h3>
+      <button type="button" id="closeCloudBtn" class="text-gray-400 hover:text-white">
+        <i class="ti ti-x text-xl"></i>
+      </button>
+    </div>
+    <div class="p-6">
+      <div class="text-center mb-5">
+        <div class="w-16 h-16 rounded-full bg-dark-700 flex items-center justify-center mx-auto mb-3">
+          <img id="cloudModalIcon" src="/images/google drive.png" alt="" class="w-10 h-10">
+        </div>
+        <p class="text-gray-400 text-sm">Tempelkan tautan file video</p>
+      </div>
+      <input type="text" id="cloudLink" class="w-full bg-dark-700 border border-gray-600 text-white px-3 py-2 rounded-lg text-sm focus:outline-none focus:ring-1 focus:ring-primary" placeholder="https://...">
+      <p id="cloudHint" class="text-xs text-gray-500 mt-2 mb-4"></p>
+      <button type="button" id="cloudImportBtn" class="w-full bg-primary hover:opacity-90 text-white py-2 rounded-lg text-sm transition-colors">
+        <i class="ti ti-download mr-2"></i>Impor Video
+      </button>
+    </div>
+  </div>
+</div>
 
-    async function apiCall(url, method, body) {
-      var opts = { method: method, headers: { 'Content-Type': 'application/json' } };
-      if (body) opts.body = JSON.stringify(body);
-      var res = await fetch(url, opts);
-      var data = {};
-      try { data = await res.json(); } catch (e) {}
-      if (!res.ok || data.success === false) {
-        throw new Error((data && data.error) || ('Request failed (' + res.status + ')'));
+<!-- Import progress modal -->
+<div id="importProgressModal" class="fixed inset-0 bg-black/60 z-50 hidden items-center justify-center p-4">
+  <div class="bg-dark-800 border border-gray-700 rounded-xl w-full max-w-sm p-6 text-center">
+    <div class="w-16 h-16 mb-4 rounded-full bg-primary/10 mx-auto flex items-center justify-center">
+      <i id="importProgressIcon" class="ti ti-download text-primary text-2xl"></i>
+    </div>
+    <p id="importProgressStatus" class="text-sm text-gray-300 mb-4">Memulai unduhan...</p>
+    <div class="w-full bg-dark-700 rounded-full h-2.5 mb-4">
+      <div id="importProgressBar" class="bg-primary h-2.5 rounded-full transition-all" style="width: 0%"></div>
+    </div>
+    <button type="button" id="importProgressClose" class="text-sm text-gray-500 hover:text-white">Tutup</button>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast" class="fixed top-16 right-4 bg-dark-800 border border-gray-700 text-white px-4 py-3 rounded-lg shadow-lg z-50 hidden items-center">
+  <i id="toastIcon" class="mr-2"></i>
+  <span id="toastMessage"></span>
+</div>
+
+<script>
+  // ============ Utilitas bersama ============
+  var GALLERY_CSRF = document.getElementById('galleryCsrf').value;
+  var CURRENT_FOLDER_ID = '<%= currentFolderId || "" %>';
+
+  function formatBytes(bytes) {
+    var b = Number(bytes) || 0;
+    if (b <= 0) return '0 B';
+    var units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    var i = Math.floor(Math.log(b) / Math.log(1024));
+    return (b / Math.pow(1024, i)).toFixed(1) + ' ' + units[i];
+  }
+
+  function showToast(type, message) {
+    var toast = document.getElementById('toast');
+    var icon = document.getElementById('toastIcon');
+    var text = document.getElementById('toastMessage');
+    if (!toast) return;
+    if (type === 'success') icon.className = 'ti ti-check text-green-400 text-xl mr-2';
+    else if (type === 'error') icon.className = 'ti ti-x text-red-400 text-xl mr-2';
+    else icon.className = 'ti ti-alert-triangle text-yellow-400 text-xl mr-2';
+    text.textContent = message;
+    toast.classList.remove('hidden');
+    toast.classList.add('flex');
+    setTimeout(function () {
+      toast.classList.add('hidden');
+      toast.classList.remove('flex');
+    }, 4000);
+  }
+
+  async function apiCall(url, method, body) {
+    var options = {
+      method: method || 'GET',
+      credentials: 'include',
+      headers: { 'X-CSRF-Token': GALLERY_CSRF }
+    };
+    if (body) {
+      options.headers['Content-Type'] = 'application/json';
+      options.body = JSON.stringify(body);
+    }
+    var res = await fetch(url, options);
+    var raw = await res.text();
+    var data;
+    try {
+      data = JSON.parse(raw);
+    } catch (parseError) {
+      if (res.status === 401 || res.status === 403 || /<html/i.test(raw)) {
+        throw new Error('Sesi login sudah habis. Refresh halaman lalu login ulang.');
       }
-      return data;
+      throw new Error('Server membalas bukan JSON (HTTP ' + res.status + '): ' + raw.slice(0, 160));
+    }
+    if (!res.ok || data.success === false) {
+      throw new Error(data.error || data.message || 'Permintaan gagal (HTTP ' + res.status + ')');
+    }
+    return data;
+  }
+
+  function renderFileSizes(scope) {
+    (scope || document).querySelectorAll('[data-filesize]').forEach(function (el) {
+      el.textContent = formatBytes(el.getAttribute('data-filesize'));
+    });
+  }
+
+  // Segarkan daftar folder & video tanpa reload halaman
+  async function refreshGallery() {
+    try {
+      var res = await fetch(window.location.href, {
+        credentials: 'include',
+        headers: { 'X-Requested-With': 'fetch' }
+      });
+      var html = await res.text();
+      var doc = new DOMParser().parseFromString(html, 'text/html');
+      var newVideos = doc.getElementById('videosSection');
+      var newFolders = doc.getElementById('foldersSection');
+      if (newVideos) document.getElementById('videosSection').innerHTML = newVideos.innerHTML;
+      if (newFolders) document.getElementById('foldersSection').innerHTML = newFolders.innerHTML;
+      renderFileSizes(document);
+      return true;
+    } catch (error) {
+      console.error('Refresh gallery gagal:', error);
+      return false;
+    }
+  }
+
+  renderFileSizes(document);
+</script>
+
+<script>
+  // ============ Folder & video (event delegation) ============
+  (function () {
+    var moveModal = document.getElementById('moveModal');
+    var moveFolderSelect = document.getElementById('moveFolderSelect');
+    var movingVideoId = null;
+
+    function openMove(videoId) {
+      movingVideoId = videoId;
+      moveFolderSelect.value = CURRENT_FOLDER_ID;
+      moveModal.classList.remove('hidden');
+      moveModal.classList.add('flex');
     }
 
-    var newFolderBtn = document.getElementById('btnNewFolder');
-    if (newFolderBtn) {
-      newFolderBtn.addEventListener('click', async function () {
+    function closeMove() {
+      movingVideoId = null;
+      moveModal.classList.add('hidden');
+      moveModal.classList.remove('flex');
+    }
+
+    document.addEventListener('click', async function (e) {
+      var renameFolder = e.target.closest('.js-rename-folder');
+      var deleteFolder = e.target.closest('.js-delete-folder');
+      var moveVideo = e.target.closest('.js-move-video');
+      var deleteVideo = e.target.closest('.js-delete-video');
+
+      if (renameFolder) {
+        var oldName = renameFolder.getAttribute('data-name');
+        var newName = prompt('Nama folder baru:', oldName);
+        if (!newName || newName === oldName) return;
+        try {
+          await apiCall('/api/media-folders/' + renameFolder.getAttribute('data-id'), 'PUT', { name: newName });
+          showToast('success', 'Folder diubah');
+          await refreshGallery();
+        } catch (error) {
+          showToast('error', error.message);
+        }
+        return;
+      }
+
+      if (deleteFolder) {
+        var folderName = deleteFolder.getAttribute('data-name');
+        if (!confirm('Hapus folder "' + folderName + '"? Video di dalamnya akan dipindah ke Root.')) return;
+        try {
+          await apiCall('/api/media-folders/' + deleteFolder.getAttribute('data-id'), 'DELETE');
+          showToast('success', 'Folder dihapus');
+          await refreshGallery();
+        } catch (error) {
+          showToast('error', error.message);
+        }
+        return;
+      }
+
+      if (moveVideo) {
+        openMove(moveVideo.getAttribute('data-id'));
+        return;
+      }
+
+      if (deleteVideo) {
+        var title = deleteVideo.getAttribute('data-title');
+        if (!confirm('Hapus video "' + title + '"?')) return;
+        try {
+          await apiCall('/api/videos/' + deleteVideo.getAttribute('data-id'), 'DELETE');
+          showToast('success', 'Video dihapus');
+          await refreshGallery();
+          if (window.reloadDiskUsage) window.reloadDiskUsage();
+        } catch (error) {
+          showToast('error', error.message);
+        }
+      }
+    });
+
+    var btnNewFolder = document.getElementById('btnNewFolder');
+    if (btnNewFolder) {
+      btnNewFolder.addEventListener('click', async function () {
         var name = prompt('Nama folder baru:');
         if (!name) return;
-        try { await apiCall('/api/media-folders', 'POST', { name: name.trim() }); location.reload(); }
-        catch (e) { alert(e.message); }
+        try {
+          await apiCall('/api/media-folders', 'POST', { name: name });
+          showToast('success', 'Folder dibuat');
+          await refreshGallery();
+        } catch (error) {
+          showToast('error', error.message);
+        }
       });
     }
 
-    document.querySelectorAll('.js-rename-folder').forEach(function (btn) {
-      btn.addEventListener('click', async function () {
-        var id = btn.getAttribute('data-id');
-        var currentName = btn.getAttribute('data-name') || '';
-        var name = prompt('Ganti nama folder:', currentName);
-        if (!name || name.trim() === currentName) return;
-        try { await apiCall('/api/media-folders/' + id, 'PUT', { name: name.trim() }); location.reload(); }
-        catch (e) { alert(e.message); }
-      });
-    });
-
-    document.querySelectorAll('.js-delete-folder').forEach(function (btn) {
-      btn.addEventListener('click', async function () {
-        var id = btn.getAttribute('data-id');
-        var name = btn.getAttribute('data-name') || '';
-        if (!confirm('Hapus folder "' + name + '" beserta semua video di dalamnya?')) return;
-        try { await apiCall('/api/media-folders/' + id, 'DELETE'); location.reload(); }
-        catch (e) { alert(e.message); }
-      });
-    });
-
-    document.querySelectorAll('.js-delete-video').forEach(function (btn) {
-      btn.addEventListener('click', async function () {
-        var id = btn.getAttribute('data-id');
-        var title = btn.getAttribute('data-title') || '';
-        if (!confirm('Hapus video "' + title + '"?')) return;
-        try { await apiCall('/api/videos/' + id, 'DELETE'); location.reload(); }
-        catch (e) { alert(e.message); }
-      });
-    });
-
-    // Move modal
-    var moveVideoId = null;
-    var moveModal = document.getElementById('moveModal');
-    function openMove(id) { moveVideoId = id; moveModal.classList.remove('hidden'); moveModal.classList.add('flex'); }
-    function closeMove() { moveVideoId = null; moveModal.classList.add('hidden'); moveModal.classList.remove('flex'); }
-
-    document.querySelectorAll('.js-move-video').forEach(function (btn) {
-      btn.addEventListener('click', function () { openMove(btn.getAttribute('data-id')); });
-    });
     document.getElementById('moveCancel').addEventListener('click', closeMove);
+
     document.getElementById('moveConfirm').addEventListener('click', async function () {
-      if (!moveVideoId) return;
-      var folderId = document.getElementById('moveFolderSelect').value;
-      try { await apiCall('/api/videos/' + moveVideoId + '/folder', 'PUT', { folderId: folderId }); location.reload(); }
-      catch (e) { alert(e.message); }
+      if (!movingVideoId) return;
+      try {
+        await apiCall('/api/videos/' + movingVideoId + '/folder', 'PUT', { folderId: moveFolderSelect.value || null });
+        closeMove();
+        showToast('success', 'Video dipindahkan');
+        await refreshGallery();
+      } catch (error) {
+        showToast('error', error.message);
+      }
     });
-    moveModal.addEventListener('click', function (e) { if (e.target === moveModal) closeMove(); });
+
+    moveModal.addEventListener('click', function (e) {
+      if (e.target === moveModal) closeMove();
+    });
   })();
 </script>
 
 <script>
-  // ===== Upload video (chunked, mendukung file besar & resume) =====
+  // ============ Upload media (port dari StreamFlow asli) ============
   (function () {
-    var FALLBACK_CHUNK = 50 * 1024 * 1024;
-    var ALLOWED_EXT = ['.mp4', '.avi', '.mov'];
+    var CHUNK_SIZE = 50 * 1024 * 1024;
+    var MAX_FILE_SIZE = 50 * 1024 * 1024 * 1024;
+    var VIDEO_EXT = ['.mp4', '.avi', '.mov'];
+    var AUDIO_EXT = ['.mp3', '.wav', '.aac', '.m4a', '.ogg', '.flac'];
+    var VIDEO_ACCEPT = 'video/mp4,video/avi,video/quicktime,.mp4,.avi,.mov';
+    var AUDIO_ACCEPT = 'audio/mpeg,audio/mp3,audio/wav,audio/aac,audio/mp4,audio/x-m4a,audio/ogg,audio/flac,.mp3,.wav,.aac,.m4a,.ogg,.flac';
 
-    var modal = document.getElementById('uploadModal');
-    var fileInput = document.getElementById('uploadFileInput');
-    var dropZone = document.getElementById('uploadDropZone');
+    var fileInput = document.getElementById('mediaFileInput');
+    var dropzone = document.getElementById('uploadDropzone');
     var folderSelect = document.getElementById('uploadFolderSelect');
-    var listEl = document.getElementById('uploadProgressList');
-    var startBtn = document.getElementById('uploadStartBtn');
+    var selectedInfo = document.getElementById('selectedFileInfo');
+    var selectedCount = document.getElementById('selectedFileCount');
+    var selectedList = document.getElementById('selectedFilesList');
+    var clearBtn = document.getElementById('clearFileButton');
+    var addMoreBtn = document.getElementById('addMoreFiles');
+    var uploadBtn = document.getElementById('uploadButton');
+    var progressWrap = document.getElementById('uploadProgress');
+    var progressBar = document.getElementById('uploadProgressBar');
+    var progressPercent = document.getElementById('uploadProgressPercent');
+    var progressStatus = document.getElementById('uploadProgressStatus');
+    var progressList = document.getElementById('uploadFilesList');
+    var errorBox = document.getElementById('uploadErrorBox');
+    var tabVideo = document.getElementById('tabVideo');
+    var tabAudio = document.getElementById('tabAudio');
+    var diskText = document.getElementById('diskUsageText');
 
-    if (!modal || !fileInput) return;
-
-    var queue = [];
+    var selectedFiles = [];
+    var uploadType = 'video';
     var busy = false;
-    var anySuccess = false;
+    var diskUsage = 0;
+    var diskLimit = 0;
 
-    function openModal() {
-      modal.classList.remove('hidden');
-      modal.classList.add('flex');
+    function showError(message) {
+      errorBox.textContent = message;
+      errorBox.classList.remove('hidden');
     }
 
-    function closeModal() {
+    function clearError() {
+      errorBox.textContent = '';
+      errorBox.classList.add('hidden');
+    }
+
+    async function loadDiskUsage() {
+      try {
+        var res = await fetch('/api/user/disk-usage', { credentials: 'include' });
+        var data = await res.json();
+        if (data.success) {
+          diskUsage = Number(data.diskUsage) || 0;
+          diskLimit = Number(data.diskLimit) || 0;
+          if (diskLimit > 0) {
+            diskText.textContent = formatBytes(diskUsage) + ' / ' + formatBytes(diskLimit);
+            diskText.classList.remove('hidden');
+          } else {
+            diskText.textContent = 'Terpakai ' + formatBytes(diskUsage);
+            diskText.classList.remove('hidden');
+          }
+        }
+      } catch (error) {
+        console.error('Gagal memuat kuota disk:', error);
+      }
+    }
+
+    window.reloadDiskUsage = loadDiskUsage;
+
+    function extOf(file) {
+      var parts = file.name.split('.');
+      return '.' + parts[parts.length - 1].toLowerCase();
+    }
+
+    function isAudioFile(file) {
+      return AUDIO_EXT.indexOf(extOf(file)) !== -1 || (file.type || '').indexOf('audio/') === 0;
+    }
+
+    function isVideoFile(file) {
+      return VIDEO_EXT.indexOf(extOf(file)) !== -1;
+    }
+
+    function matchesTab(file) {
+      return uploadType === 'video' ? isVideoFile(file) : isAudioFile(file);
+    }
+
+    function setTab(type) {
+      if (busy) return;
+      uploadType = type;
+      var activeCls = 'flex-1 py-2 px-4 rounded-lg bg-primary text-white text-sm transition-colors';
+      var idleCls = 'flex-1 py-2 px-4 rounded-lg bg-dark-700 text-gray-400 hover:text-white text-sm transition-colors';
+      tabVideo.className = type === 'video' ? activeCls : idleCls;
+      tabAudio.className = type === 'audio' ? activeCls : idleCls;
+      document.getElementById('dropzoneIcon').className = type === 'video'
+        ? 'ti ti-video text-2xl text-gray-400'
+        : 'ti ti-music text-2xl text-gray-400';
+      document.getElementById('dropzoneText').textContent = type === 'video'
+        ? 'Tarik & lepas file video ke sini'
+        : 'Tarik & lepas file audio ke sini';
+      document.getElementById('dropzoneFormats').textContent = type === 'video'
+        ? 'Format: MP4, AVI, MOV (maks 50GB)'
+        : 'Format: MP3, WAV, AAC, M4A, OGG, FLAC';
+      fileInput.accept = type === 'video' ? VIDEO_ACCEPT : AUDIO_ACCEPT;
+      resetSelection();
+    }
+
+    function resetSelection() {
+      selectedFiles = [];
+      selectedList.innerHTML = '';
+      selectedInfo.classList.add('hidden');
+      progressWrap.classList.add('hidden');
+      progressList.innerHTML = '';
+      progressBar.style.width = '0%';
+      progressPercent.textContent = '0%';
+      uploadBtn.disabled = true;
+      clearError();
+    }
+
+    function renderSelected() {
+      var total = selectedFiles.reduce(function (sum, f) { return sum + f.size; }, 0);
+      selectedCount.textContent = selectedFiles.length + ' file (' + formatBytes(total) + ')';
+      selectedList.innerHTML = '';
+
+      selectedFiles.forEach(function (file, index) {
+        var row = document.createElement('div');
+        row.className = 'flex items-center justify-between p-2 rounded-lg hover:bg-dark-600 transition-colors';
+
+        var left = document.createElement('div');
+        left.className = 'flex items-center gap-3 min-w-0';
+
+        var iconWrap = document.createElement('div');
+        iconWrap.className = 'w-8 h-8 rounded bg-dark-600 flex items-center justify-center shrink-0';
+        var icon = document.createElement('i');
+        icon.className = isAudioFile(file) ? 'ti ti-music text-gray-400 text-sm' : 'ti ti-video text-gray-400 text-sm';
+        iconWrap.appendChild(icon);
+
+        var meta = document.createElement('div');
+        meta.className = 'min-w-0';
+        var nameEl = document.createElement('p');
+        nameEl.className = 'text-sm truncate';
+        nameEl.textContent = file.name;
+        var sizeEl = document.createElement('p');
+        sizeEl.className = 'text-xs text-gray-500';
+        sizeEl.textContent = formatBytes(file.size);
+        meta.appendChild(nameEl);
+        meta.appendChild(sizeEl);
+
+        left.appendChild(iconWrap);
+        left.appendChild(meta);
+
+        var removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'text-gray-400 hover:text-red-400 p-1';
+        removeBtn.innerHTML = '<i class="ti ti-x text-sm"></i>';
+        removeBtn.addEventListener('click', function () {
+          if (busy) return;
+          selectedFiles.splice(index, 1);
+          if (selectedFiles.length > 0) renderSelected();
+          else resetSelection();
+        });
+
+        row.appendChild(left);
+        row.appendChild(removeBtn);
+        selectedList.appendChild(row);
+      });
+
+      selectedInfo.classList.remove('hidden');
+      uploadBtn.disabled = selectedFiles.length === 0;
+    }
+
+    function addFiles(files) {
       if (busy) {
-        alert('Upload sedang berjalan. Mohon tunggu sampai selesai.');
+        showError('Upload sedang berjalan. Tunggu sampai selesai.');
         return;
       }
-      modal.classList.add('hidden');
-      modal.classList.remove('flex');
-      if (anySuccess) location.reload();
+      clearError();
+
+      var incoming = Array.prototype.slice.call(files);
+      var rejected = [];
+      var accepted = [];
+
+      incoming.forEach(function (file) {
+        if (!matchesTab(file)) {
+          rejected.push(file.name);
+          return;
+        }
+        if (file.size > MAX_FILE_SIZE) {
+          rejected.push(file.name + ' (lebih dari 50GB)');
+          return;
+        }
+        var duplicate = selectedFiles.some(function (f) {
+          return f.name === file.name && f.size === file.size;
+        });
+        if (!duplicate) accepted.push(file);
+      });
+
+      if (rejected.length > 0) {
+        showError('File dilewati: ' + rejected.join(', ') + '\nTab aktif: ' + uploadType.toUpperCase());
+      }
+      if (accepted.length === 0) return;
+
+      var pendingSize = selectedFiles.concat(accepted).reduce(function (sum, f) { return sum + f.size; }, 0);
+      if (diskLimit > 0 && (diskUsage + pendingSize) > diskLimit) {
+        var remaining = Math.max(0, diskLimit - diskUsage);
+        showError('Kuota disk tidak cukup. Sisa ruang: ' + formatBytes(remaining));
+        return;
+      }
+
+      selectedFiles = selectedFiles.concat(accepted);
+      renderSelected();
     }
 
-    function showUploadError(message) {
-      var boxes = document.querySelectorAll('.js-upload-error');
-      if (!boxes.length) {
-        alert(message);
-        return;
-      }
-      Array.prototype.forEach.call(boxes, function (box) {
-        box.textContent = message;
-        box.classList.remove('hidden');
+    function makeProgressRows() {
+      progressList.innerHTML = '';
+      return selectedFiles.map(function (file) {
+        var row = document.createElement('div');
+        row.className = 'flex items-center justify-between p-2 rounded-lg';
+
+        var name = document.createElement('span');
+        name.className = 'text-sm truncate mr-2';
+        name.textContent = file.name;
+
+        var status = document.createElement('span');
+        status.className = 'text-xs text-gray-500 shrink-0';
+        status.textContent = 'Menunggu';
+
+        row.appendChild(name);
+        row.appendChild(status);
+        progressList.appendChild(row);
+        return status;
       });
     }
 
-    function clearUploadError() {
-      var boxes = document.querySelectorAll('.js-upload-error');
-      Array.prototype.forEach.call(boxes, function (box) {
-        box.textContent = '';
-        box.classList.add('hidden');
+    function setOverall(index, ratio) {
+      var overall = Math.round(((index + ratio) / selectedFiles.length) * 100);
+      progressBar.style.width = overall + '%';
+      progressPercent.textContent = overall + '%';
+    }
+
+    function uploadSimple(file, index, endpoint, field) {
+      return new Promise(function (resolve) {
+        var form = new FormData();
+        form.append(field, file);
+        form.append('folderId', folderSelect.value || '');
+        form.append('_csrf', GALLERY_CSRF);
+
+        var xhr = new XMLHttpRequest();
+        xhr.timeout = 60 * 60 * 1000;
+
+        xhr.upload.addEventListener('progress', function (e) {
+          if (!e.lengthComputable) return;
+          var ratio = e.loaded / e.total;
+          setOverall(index, ratio);
+          statusCells[index].textContent = Math.round(ratio * 100) + '%';
+          statusCells[index].className = 'text-xs text-primary shrink-0';
+        });
+
+        xhr.addEventListener('load', function () {
+          if (xhr.status !== 200) {
+            resolve({ success: false, error: 'HTTP ' + xhr.status + ': ' + xhr.responseText.slice(0, 160) });
+            return;
+          }
+          try {
+            var parsed = JSON.parse(xhr.responseText);
+            resolve({ success: parsed.success !== false, error: parsed.error });
+          } catch (parseError) {
+            resolve({ success: false, error: 'Respons server bukan JSON' });
+          }
+        });
+
+        xhr.addEventListener('error', function () {
+          resolve({ success: false, error: 'Koneksi terputus' });
+        });
+        xhr.addEventListener('timeout', function () {
+          resolve({ success: false, error: 'Waktu upload habis' });
+        });
+
+        xhr.open('POST', endpoint, true);
+        xhr.setRequestHeader('X-CSRF-Token', GALLERY_CSRF);
+        xhr.send(form);
       });
     }
 
     async function readJson(res, tag) {
-      var text = await res.text();
+      var raw = await res.text();
       try {
-        return JSON.parse(text);
+        return JSON.parse(raw);
       } catch (parseError) {
-        if (res.status === 401 || res.status === 403 || /<html/i.test(text)) {
-          throw new Error('Sesi login sudah habis (HTTP ' + res.status + '). Refresh halaman ini lalu login ulang.');
+        if (res.status === 401 || res.status === 403 || /<html/i.test(raw)) {
+          throw new Error('Sesi login sudah habis. Refresh halaman lalu login ulang.');
         }
-        throw new Error('Server membalas bukan JSON pada tahap "' + tag + '" (HTTP ' + res.status + '): ' + text.slice(0, 200));
+        throw new Error('Respons bukan JSON pada tahap ' + tag + ' (HTTP ' + res.status + '): ' + raw.slice(0, 160));
       }
     }
 
-    function formatBytes(b) {
-      if (!b || isNaN(b)) return '0 B';
-      var units = ['B', 'KB', 'MB', 'GB', 'TB'];
-      var i = Math.floor(Math.log(b) / Math.log(1024));
-      return (b / Math.pow(1024, i)).toFixed(1) + ' ' + units[i];
-    }
-
-    function makeRow(file, container) {
-      var wrap = document.createElement('div');
-      wrap.className = 'bg-dark-900 rounded-lg p-3';
-
-      var top = document.createElement('div');
-      top.className = 'flex items-center justify-between gap-2 mb-2';
-
-      var name = document.createElement('span');
-      name.className = 'text-xs text-gray-300 truncate';
-      name.textContent = file.name + ' (' + formatBytes(file.size) + ')';
-
-      var status = document.createElement('span');
-      status.className = 'text-xs text-gray-500 shrink-0';
-      status.textContent = 'Menunggu';
-
-      top.appendChild(name);
-      top.appendChild(status);
-
-      var barWrap = document.createElement('div');
-      barWrap.className = 'h-1.5 bg-dark-700 rounded-full overflow-hidden';
-
-      var bar = document.createElement('div');
-      bar.className = 'h-full bg-primary transition-all';
-      bar.style.width = '0%';
-      barWrap.appendChild(bar);
-
-      wrap.appendChild(top);
-      wrap.appendChild(barWrap);
-      var target = container || listEl;
-      if (target) target.appendChild(wrap);
-
-      return { bar: bar, status: status };
-    }
-
-    function setProgress(row, percent) {
-      row.bar.style.width = percent + '%';
-      row.status.textContent = percent + '%';
-    }
-
-    function isAllowed(file) {
-      var lower = file.name.toLowerCase();
-      for (var i = 0; i < ALLOWED_EXT.length; i++) {
-        if (lower.slice(-ALLOWED_EXT[i].length) === ALLOWED_EXT[i]) return true;
-      }
-      return false;
-    }
-
-    function addFiles(files, container) {
-      for (var i = 0; i < files.length; i++) {
-        var file = files[i];
-        if (!isAllowed(file)) {
-          alert('Format tidak didukung: ' + file.name + '\nHanya MP4, AVI, dan MOV.');
-          continue;
-        }
-        queue.push({ file: file, row: makeRow(file, container), done: false });
-      }
-    }
-
-    async function uploadOne(item) {
-      var file = item.file;
-      var row = item.row;
-
-      row.status.textContent = 'Menyiapkan...';
+    async function uploadChunked(file, index) {
+      var totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
 
       var initRes = await fetch('/api/videos/chunk/init', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': GALLERY_CSRF },
         body: JSON.stringify({
           filename: file.name,
           fileSize: file.size,
-          totalChunks: Math.max(1, Math.ceil(file.size / FALLBACK_CHUNK)),
-          folderId: folderSelect ? folderSelect.value : ''
+          totalChunks: totalChunks,
+          folderId: folderSelect.value || ''
         })
       });
 
       var initData = await readJson(initRes, 'init');
+      if (!initData.success) throw new Error(initData.error || 'Gagal memulai upload');
 
-      if (!initData.success) {
-        throw new Error(initData.error || 'Gagal memulai upload');
-      }
-
-      var chunkSize = initData.chunkSize || FALLBACK_CHUNK;
-      var totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
-      var uploaded = {};
-
-      (initData.uploadedChunks || []).forEach(function (index) {
-        uploaded[index] = true;
-      });
+      var chunkSize = initData.chunkSize || CHUNK_SIZE;
+      totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
+      var uploaded = initData.uploadedChunks || [];
 
       if (initData.resumed) {
-        row.status.textContent = 'Melanjutkan...';
+        statusCells[index].textContent = 'Melanjutkan...';
       }
 
       for (var i = 0; i < totalChunks; i++) {
-        var percent = Math.round(((i + 1) / totalChunks) * 100);
-
-        if (uploaded[i]) {
-          setProgress(row, percent);
+        if (uploaded.indexOf(i) !== -1) {
+          setOverall(index, (i + 1) / totalChunks);
           continue;
         }
 
         var start = i * chunkSize;
         var blob = file.slice(start, Math.min(start + chunkSize, file.size));
+        var retries = 3;
+        var lastError = 'Upload potongan gagal';
 
-        var chunkRes = await fetch('/api/videos/chunk/upload', {
-          method: 'POST',
-          credentials: 'include',
-          headers: {
-            'Content-Type': 'application/octet-stream',
-            'X-Upload-Id': initData.uploadId,
-            'X-Chunk-Index': String(i)
-          },
-          body: blob
-        });
-
-        var chunkData = await readJson(chunkRes, 'chunk ' + i);
-
-        if (!chunkData.success) {
-          throw new Error(chunkData.error || 'Gagal mengunggah bagian file');
+        while (retries > 0) {
+          try {
+            var chunkRes = await fetch('/api/videos/chunk/upload', {
+              method: 'POST',
+              credentials: 'include',
+              headers: {
+                'Content-Type': 'application/octet-stream',
+                'X-CSRF-Token': GALLERY_CSRF,
+                'X-Upload-Id': initData.uploadId,
+                'X-Chunk-Index': String(i)
+              },
+              body: blob
+            });
+            var chunkData = await readJson(chunkRes, 'potongan ' + (i + 1));
+            if (chunkData.success) {
+              uploaded = chunkData.uploadedChunks || uploaded;
+              break;
+            }
+            lastError = chunkData.error || lastError;
+            throw new Error(lastError);
+          } catch (chunkError) {
+            lastError = chunkError.message || lastError;
+            retries--;
+            if (retries === 0) throw new Error(lastError);
+            await new Promise(function (done) { setTimeout(done, 1000); });
+          }
         }
 
-        setProgress(row, percent);
+        var ratio = Math.min(1, ((i + 1) * chunkSize) / file.size);
+        setOverall(index, ratio);
+        statusCells[index].textContent = Math.round(ratio * 100) + '%';
+        statusCells[index].className = 'text-xs text-primary shrink-0';
       }
 
-      row.status.textContent = 'Memproses...';
+      statusCells[index].textContent = 'Memproses...';
 
       var doneRes = await fetch('/api/videos/chunk/complete', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': GALLERY_CSRF },
         body: JSON.stringify({ uploadId: initData.uploadId })
       });
 
       var doneData = await readJson(doneRes, 'complete');
-
-      if (!doneData.success) {
-        throw new Error(doneData.error || 'Gagal menyelesaikan upload');
-      }
-
-      row.status.textContent = 'Selesai';
-      row.status.className = 'text-xs text-green-400 shrink-0';
-      item.done = true;
-      anySuccess = true;
+      if (!doneData.success) throw new Error(doneData.error || 'Gagal menyelesaikan upload');
+      return { success: true };
     }
 
-    async function runQueue() {
-      var pending = queue.filter(function (item) { return !item.done; });
+    var statusCells = [];
 
-      if (pending.length === 0) {
-        alert('Pilih file video dulu.');
-        return;
-      }
+    async function runUpload() {
+      if (busy || selectedFiles.length === 0) return;
 
       busy = true;
-      startBtn.disabled = true;
-      startBtn.classList.add('opacity-60', 'cursor-not-allowed');
+      clearError();
+      uploadBtn.disabled = true;
+      uploadBtn.classList.add('opacity-60');
+      progressWrap.classList.remove('hidden');
+      statusCells = makeProgressRows();
 
-      for (var i = 0; i < pending.length; i++) {
+      var okCount = 0;
+      var failed = [];
+
+      for (var i = 0; i < selectedFiles.length; i++) {
+        var file = selectedFiles[i];
+        progressStatus.textContent = 'Mengunggah ' + (i + 1) + '/' + selectedFiles.length + ': ' + file.name;
+        statusCells[i].textContent = 'Menyiapkan...';
+
+        var result;
         try {
-          await uploadOne(pending[i]);
+          if (isAudioFile(file)) {
+            result = await uploadSimple(file, i, '/api/audio/upload', 'audio');
+          } else if (file.size > CHUNK_SIZE) {
+            result = await uploadChunked(file, i);
+          } else {
+            result = await uploadSimple(file, i, '/api/videos/upload', 'video');
+          }
         } catch (error) {
-          console.error('Upload error:', error);
-          pending[i].row.status.textContent = 'Gagal';
-          pending[i].row.status.className = 'text-xs text-red-400 shrink-0';
-          showUploadError('Upload gagal (' + pending[i].file.name + '): ' + error.message);
+          result = { success: false, error: error.message };
+        }
+
+        if (result && result.success) {
+          okCount++;
+          statusCells[i].textContent = 'Selesai';
+          statusCells[i].className = 'text-xs text-green-400 shrink-0';
+          setOverall(i, 1);
+        } else {
+          failed.push(file.name + ': ' + ((result && result.error) || 'gagal'));
+          statusCells[i].textContent = 'Gagal';
+          statusCells[i].className = 'text-xs text-red-400 shrink-0';
         }
       }
 
       busy = false;
-      startBtn.disabled = false;
-      startBtn.classList.remove('opacity-60', 'cursor-not-allowed');
+      uploadBtn.classList.remove('opacity-60');
+      progressStatus.textContent = 'Selesai: ' + okCount + ' berhasil, ' + failed.length + ' gagal';
 
-      if (anySuccess) location.reload();
+      if (failed.length > 0) {
+        showError('Beberapa file gagal:\n' + failed.join('\n'));
+        showToast('warning', okCount + ' berhasil, ' + failed.length + ' gagal');
+      } else {
+        showToast('success', okCount + ' file berhasil diunggah');
+      }
+
+      if (okCount > 0) {
+        await refreshGallery();
+        await loadDiskUsage();
+        selectedFiles = [];
+        selectedList.innerHTML = '';
+        selectedInfo.classList.add('hidden');
+      }
+
+      uploadBtn.disabled = selectedFiles.length === 0;
     }
 
-    document.querySelectorAll('.js-open-upload').forEach(function (btn) {
-      btn.addEventListener('click', openModal);
-    });
+    // ---- Event wiring ----
+    tabVideo.addEventListener('click', function () { setTab('video'); });
+    tabAudio.addEventListener('click', function () { setTab('audio'); });
 
-    document.getElementById('uploadCloseBtn').addEventListener('click', closeModal);
-    document.getElementById('uploadCancelBtn').addEventListener('click', closeModal);
-
-    modal.addEventListener('click', function (e) {
-      if (e.target === modal) closeModal();
-    });
-
-    dropZone.addEventListener('click', function () { fileInput.click(); });
+    dropzone.addEventListener('click', function () { fileInput.click(); });
+    if (addMoreBtn) addMoreBtn.addEventListener('click', function () { fileInput.click(); });
+    if (clearBtn) clearBtn.addEventListener('click', function () { if (!busy) resetSelection(); });
 
     fileInput.addEventListener('change', function () {
       addFiles(fileInput.files);
@@ -542,76 +941,40 @@
     });
 
     ['dragenter', 'dragover'].forEach(function (evt) {
-      dropZone.addEventListener(evt, function (e) {
+      dropzone.addEventListener(evt, function (e) {
         e.preventDefault();
-        dropZone.classList.add('border-primary');
+        e.stopPropagation();
+        dropzone.classList.add('border-primary');
       });
     });
 
     ['dragleave', 'drop'].forEach(function (evt) {
-      dropZone.addEventListener(evt, function (e) {
+      dropzone.addEventListener(evt, function (e) {
         e.preventDefault();
-        dropZone.classList.remove('border-primary');
+        e.stopPropagation();
+        dropzone.classList.remove('border-primary');
       });
     });
 
-    dropZone.addEventListener('drop', function (e) {
+    dropzone.addEventListener('drop', function (e) {
       if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
     });
 
-    if (startBtn) startBtn.addEventListener('click', runQueue);
-
-    // ===== Kolom drop upload di halaman Gallery =====
-    var inlineZone = document.getElementById('inlineDropZone');
-    var inlineInput = document.getElementById('inlineFileInput');
-    var inlineList = document.getElementById('inlineProgressList');
-    var inlineFolder = document.getElementById('inlineFolderSelect');
-
-    function handleInlineFiles(files) {
-      if (busy) {
-        showUploadError('Masih ada upload yang berjalan. Tunggu sampai selesai.');
-        return;
-      }
-      clearUploadError();
-      if (inlineFolder && folderSelect) folderSelect.value = inlineFolder.value;
-      addFiles(files, inlineList);
-      runQueue();
-    }
-
-    if (inlineZone && inlineInput) {
-      inlineZone.addEventListener('click', function () { inlineInput.click(); });
-
-      inlineInput.addEventListener('change', function () {
-        handleInlineFiles(inlineInput.files);
-        inlineInput.value = '';
-      });
-
-      ['dragenter', 'dragover'].forEach(function (evt) {
-        inlineZone.addEventListener(evt, function (e) {
-          e.preventDefault();
-          e.stopPropagation();
-          inlineZone.classList.add('border-primary');
-        });
-      });
-
-      ['dragleave', 'drop'].forEach(function (evt) {
-        inlineZone.addEventListener(evt, function (e) {
-          e.preventDefault();
-          e.stopPropagation();
-          inlineZone.classList.remove('border-primary');
-        });
-      });
-
-      inlineZone.addEventListener('drop', function (e) {
-        if (e.dataTransfer && e.dataTransfer.files) handleInlineFiles(e.dataTransfer.files);
-      });
-    }
-
     ['dragover', 'drop'].forEach(function (evt) {
       document.addEventListener(evt, function (e) {
-        if (e.target && e.target.closest && e.target.closest('#inlineDropZone, #uploadDropZone')) return;
+        if (e.target && e.target.closest && e.target.closest('#uploadDropzone')) return;
         e.preventDefault();
       });
+    });
+
+    uploadBtn.addEventListener('click', runUpload);
+
+    document.addEventListener('click', function (e) {
+      if (e.target.closest('.js-focus-upload')) {
+        document.getElementById('uploadCard').scrollIntoView({ behavior: 'smooth', block: 'center' });
+        dropzone.classList.add('border-primary');
+        setTimeout(function () { dropzone.classList.remove('border-primary'); }, 1200);
+      }
     });
 
     window.addEventListener('beforeunload', function (e) {
@@ -619,6 +982,166 @@
         e.preventDefault();
         e.returnValue = '';
       }
+    });
+
+    loadDiskUsage();
+  })();
+</script>
+
+<script>
+  // ============ Impor dari cloud ============
+  (function () {
+    var CONFIGS = {
+      gdrive: {
+        title: 'Impor dari Google Drive',
+        icon: '/images/google drive.png',
+        placeholder: 'https://drive.google.com/file/d/...',
+        hint: 'Pastikan file dibagikan sebagai "Anyone with the link".',
+        endpoint: '/api/videos/import-drive',
+        field: 'driveUrl'
+      },
+      mediafire: {
+        title: 'Impor dari MediaFire',
+        icon: '/images/mediafire.png',
+        placeholder: 'https://www.mediafire.com/file/...',
+        hint: 'Tempelkan tautan file MediaFire.',
+        endpoint: '/api/videos/import-mediafire',
+        field: 'mediafireUrl'
+      },
+      dropbox: {
+        title: 'Impor dari Dropbox',
+        icon: '/images/dropbox.png',
+        placeholder: 'https://www.dropbox.com/...',
+        hint: 'Pastikan file dapat diakses publik.',
+        endpoint: '/api/videos/import-dropbox',
+        field: 'dropboxUrl'
+      },
+      mega: {
+        title: 'Impor dari MEGA',
+        icon: '/images/mega.png',
+        placeholder: 'https://mega.nz/file/...',
+        hint: 'Hanya file publik yang didukung.',
+        endpoint: '/api/videos/import-mega',
+        field: 'megaUrl'
+      }
+    };
+
+    var dropdown = document.getElementById('cloudDropdown');
+    var dropdownBtn = document.getElementById('btnCloudDropdown');
+    var modal = document.getElementById('cloudImportModal');
+    var linkInput = document.getElementById('cloudLink');
+    var importBtn = document.getElementById('cloudImportBtn');
+    var progressModal = document.getElementById('importProgressModal');
+    var active = null;
+    var poller = null;
+
+    dropdownBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      dropdown.classList.toggle('hidden');
+    });
+
+    document.addEventListener('click', function (e) {
+      if (!e.target.closest('#cloudDropdown') && !e.target.closest('#btnCloudDropdown')) {
+        dropdown.classList.add('hidden');
+      }
+
+      var opener = e.target.closest('.js-cloud-open');
+      if (opener) {
+        active = CONFIGS[opener.getAttribute('data-type')];
+        if (!active) return;
+        dropdown.classList.add('hidden');
+        document.getElementById('cloudModalTitle').textContent = active.title;
+        document.getElementById('cloudModalIcon').src = active.icon;
+        document.getElementById('cloudHint').textContent = active.hint;
+        linkInput.value = '';
+        linkInput.placeholder = active.placeholder;
+        modal.classList.remove('hidden');
+        modal.classList.add('flex');
+      }
+    });
+
+    function closeModal() {
+      modal.classList.add('hidden');
+      modal.classList.remove('flex');
+    }
+
+    document.getElementById('closeCloudBtn').addEventListener('click', closeModal);
+    modal.addEventListener('click', function (e) {
+      if (e.target === modal) closeModal();
+    });
+
+    document.getElementById('importProgressClose').addEventListener('click', function () {
+      progressModal.classList.add('hidden');
+      progressModal.classList.remove('flex');
+      if (poller) clearInterval(poller);
+    });
+
+    function trackImport(jobId) {
+      progressModal.classList.remove('hidden');
+      progressModal.classList.add('flex');
+      document.getElementById('importProgressIcon').className = 'ti ti-download text-primary text-2xl';
+      document.getElementById('importProgressBar').style.width = '0%';
+      document.getElementById('importProgressStatus').textContent = 'Memulai unduhan...';
+
+      if (poller) clearInterval(poller);
+
+      poller = setInterval(async function () {
+        try {
+          var res = await fetch('/api/videos/import-status/' + jobId, { credentials: 'include' });
+          var data = await res.json();
+          if (!data.success || !data.status) {
+            clearInterval(poller);
+            return;
+          }
+          var status = data.status;
+          document.getElementById('importProgressBar').style.width = (status.progress || 0) + '%';
+          document.getElementById('importProgressStatus').textContent = status.message || '';
+
+          if (status.status === 'complete') {
+            clearInterval(poller);
+            document.getElementById('importProgressIcon').className = 'ti ti-check text-green-400 text-2xl';
+            showToast('success', 'Video berhasil diimpor');
+            await refreshGallery();
+            if (window.reloadDiskUsage) window.reloadDiskUsage();
+          } else if (status.status === 'failed') {
+            clearInterval(poller);
+            document.getElementById('importProgressIcon').className = 'ti ti-x text-red-400 text-2xl';
+            showToast('error', status.message || 'Impor gagal');
+          }
+        } catch (error) {
+          clearInterval(poller);
+          console.error('Polling impor gagal:', error);
+        }
+      }, 1500);
+    }
+
+    importBtn.addEventListener('click', async function () {
+      var link = linkInput.value.trim();
+      if (!link) {
+        showToast('error', 'Masukkan tautan terlebih dahulu');
+        return;
+      }
+      if (!active) return;
+
+      importBtn.disabled = true;
+      importBtn.textContent = 'Memproses...';
+
+      try {
+        var body = { folderId: document.getElementById('uploadFolderSelect').value || '' };
+        body[active.field] = link;
+        var data = await apiCall(active.endpoint, 'POST', body);
+        closeModal();
+        if (data.jobId) trackImport(data.jobId);
+        else {
+          showToast('success', 'Impor dimulai');
+          await refreshGallery();
+        }
+      } catch (error) {
+        showToast('error', error.message);
+      }
+
+      importBtn.disabled = false;
+      importBtn.innerHTML = '<i class="ti ti-download mr-2"></i>Impor Video';
     });
   })();
 </script>
