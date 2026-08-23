@@ -32,9 +32,9 @@
         <i class="ti ti-folder-plus"></i> New Folder
       </button>
       <% } %>
-      <a href="/dashboard" class="flex items-center gap-2 px-4 py-2 rounded-lg bg-primary hover:opacity-90 text-sm transition-colors">
+      <button type="button" id="btnUploadVideo" class="js-open-upload flex items-center gap-2 px-4 py-2 rounded-lg bg-primary hover:opacity-90 text-sm transition-colors">
         <i class="ti ti-upload"></i> Upload Video
-      </a>
+      </button>
     </div>
   </div>
 
@@ -109,9 +109,45 @@
     <div class="flex flex-col items-center justify-center py-16 text-center">
       <i class="ti ti-photo-off text-4xl text-gray-600 mb-3"></i>
       <p class="text-gray-400">Belum ada video di sini.</p>
-      <a href="/dashboard" class="mt-3 text-primary text-sm hover:underline">Upload video di Dashboard</a>
+      <button type="button" class="js-open-upload mt-3 text-primary text-sm hover:underline">Upload video sekarang</button>
     </div>
     <% } %>
+  </div>
+</div>
+
+<!-- Upload video modal -->
+<div id="uploadModal" class="fixed inset-0 bg-black/60 z-50 hidden items-center justify-center p-4">
+  <div class="bg-dark-800 border border-gray-700 rounded-xl w-full max-w-lg p-5">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="font-semibold">Upload Video</h3>
+      <button type="button" id="uploadCloseBtn" class="text-gray-400 hover:text-white">
+        <i class="ti ti-x"></i>
+      </button>
+    </div>
+
+    <div id="uploadDropZone" class="border-2 border-dashed border-gray-600 rounded-lg p-6 text-center cursor-pointer hover:border-primary transition-colors">
+      <i class="ti ti-cloud-upload text-3xl text-gray-500"></i>
+      <p class="text-sm text-gray-300 mt-2">Tarik file ke sini atau <span class="text-primary">klik untuk pilih file</span></p>
+      <p class="text-xs text-gray-500 mt-1">Format: MP4, AVI, MOV &middot; file besar didukung (upload bertahap 50 MB)</p>
+      <input type="file" id="uploadFileInput" accept=".mp4,.avi,.mov,video/mp4,video/x-msvideo,video/quicktime" multiple class="hidden">
+    </div>
+
+    <div class="mt-4">
+      <label class="text-xs text-gray-400 block mb-1">Simpan ke folder</label>
+      <select id="uploadFolderSelect" class="w-full bg-dark-700 border border-gray-700 rounded-lg px-3 py-2 text-sm">
+        <option value="">Root (tanpa folder)</option>
+        <% (folders || []).forEach(function(folder) { %>
+        <option value="<%= folder.id %>" <%= (typeof currentFolderId !== 'undefined' && currentFolderId === folder.id) ? 'selected' : '' %>><%= folder.name %></option>
+        <% }); %>
+      </select>
+    </div>
+
+    <div id="uploadProgressList" class="mt-4 space-y-2 max-h-52 overflow-y-auto"></div>
+
+    <div class="flex justify-end gap-2 mt-5">
+      <button type="button" id="uploadCancelBtn" class="px-4 py-2 rounded-lg bg-dark-700 hover:bg-dark-600 text-sm">Tutup</button>
+      <button type="button" id="uploadStartBtn" class="px-4 py-2 rounded-lg bg-primary hover:opacity-90 text-sm">Mulai Upload</button>
+    </div>
   </div>
 </div>
 
@@ -213,5 +249,268 @@
       catch (e) { alert(e.message); }
     });
     moveModal.addEventListener('click', function (e) { if (e.target === moveModal) closeMove(); });
+  })();
+</script>
+
+<script>
+  // ===== Upload video (chunked, mendukung file besar & resume) =====
+  (function () {
+    var FALLBACK_CHUNK = 50 * 1024 * 1024;
+    var ALLOWED_EXT = ['.mp4', '.avi', '.mov'];
+
+    var modal = document.getElementById('uploadModal');
+    var fileInput = document.getElementById('uploadFileInput');
+    var dropZone = document.getElementById('uploadDropZone');
+    var folderSelect = document.getElementById('uploadFolderSelect');
+    var listEl = document.getElementById('uploadProgressList');
+    var startBtn = document.getElementById('uploadStartBtn');
+
+    if (!modal || !fileInput) return;
+
+    var queue = [];
+    var busy = false;
+    var anySuccess = false;
+
+    function openModal() {
+      modal.classList.remove('hidden');
+      modal.classList.add('flex');
+    }
+
+    function closeModal() {
+      if (busy) {
+        alert('Upload sedang berjalan. Mohon tunggu sampai selesai.');
+        return;
+      }
+      modal.classList.add('hidden');
+      modal.classList.remove('flex');
+      if (anySuccess) location.reload();
+    }
+
+    function formatBytes(b) {
+      if (!b || isNaN(b)) return '0 B';
+      var units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      var i = Math.floor(Math.log(b) / Math.log(1024));
+      return (b / Math.pow(1024, i)).toFixed(1) + ' ' + units[i];
+    }
+
+    function makeRow(file) {
+      var wrap = document.createElement('div');
+      wrap.className = 'bg-dark-900 rounded-lg p-3';
+
+      var top = document.createElement('div');
+      top.className = 'flex items-center justify-between gap-2 mb-2';
+
+      var name = document.createElement('span');
+      name.className = 'text-xs text-gray-300 truncate';
+      name.textContent = file.name + ' (' + formatBytes(file.size) + ')';
+
+      var status = document.createElement('span');
+      status.className = 'text-xs text-gray-500 shrink-0';
+      status.textContent = 'Menunggu';
+
+      top.appendChild(name);
+      top.appendChild(status);
+
+      var barWrap = document.createElement('div');
+      barWrap.className = 'h-1.5 bg-dark-700 rounded-full overflow-hidden';
+
+      var bar = document.createElement('div');
+      bar.className = 'h-full bg-primary transition-all';
+      bar.style.width = '0%';
+      barWrap.appendChild(bar);
+
+      wrap.appendChild(top);
+      wrap.appendChild(barWrap);
+      listEl.appendChild(wrap);
+
+      return { bar: bar, status: status };
+    }
+
+    function setProgress(row, percent) {
+      row.bar.style.width = percent + '%';
+      row.status.textContent = percent + '%';
+    }
+
+    function isAllowed(file) {
+      var lower = file.name.toLowerCase();
+      for (var i = 0; i < ALLOWED_EXT.length; i++) {
+        if (lower.slice(-ALLOWED_EXT[i].length) === ALLOWED_EXT[i]) return true;
+      }
+      return false;
+    }
+
+    function addFiles(files) {
+      for (var i = 0; i < files.length; i++) {
+        var file = files[i];
+        if (!isAllowed(file)) {
+          alert('Format tidak didukung: ' + file.name + '\nHanya MP4, AVI, dan MOV.');
+          continue;
+        }
+        queue.push({ file: file, row: makeRow(file), done: false });
+      }
+    }
+
+    async function uploadOne(item) {
+      var file = item.file;
+      var row = item.row;
+
+      row.status.textContent = 'Menyiapkan...';
+
+      var initRes = await fetch('/api/videos/chunk/init', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          filename: file.name,
+          fileSize: file.size,
+          totalChunks: Math.max(1, Math.ceil(file.size / FALLBACK_CHUNK)),
+          folderId: folderSelect ? folderSelect.value : ''
+        })
+      });
+
+      var initData = await initRes.json();
+
+      if (!initData.success) {
+        throw new Error(initData.error || 'Gagal memulai upload');
+      }
+
+      var chunkSize = initData.chunkSize || FALLBACK_CHUNK;
+      var totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
+      var uploaded = {};
+
+      (initData.uploadedChunks || []).forEach(function (index) {
+        uploaded[index] = true;
+      });
+
+      if (initData.resumed) {
+        row.status.textContent = 'Melanjutkan...';
+      }
+
+      for (var i = 0; i < totalChunks; i++) {
+        var percent = Math.round(((i + 1) / totalChunks) * 100);
+
+        if (uploaded[i]) {
+          setProgress(row, percent);
+          continue;
+        }
+
+        var start = i * chunkSize;
+        var blob = file.slice(start, Math.min(start + chunkSize, file.size));
+
+        var chunkRes = await fetch('/api/videos/chunk/upload', {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'X-Upload-Id': initData.uploadId,
+            'X-Chunk-Index': String(i)
+          },
+          body: blob
+        });
+
+        var chunkData = await chunkRes.json();
+
+        if (!chunkData.success) {
+          throw new Error(chunkData.error || 'Gagal mengunggah bagian file');
+        }
+
+        setProgress(row, percent);
+      }
+
+      row.status.textContent = 'Memproses...';
+
+      var doneRes = await fetch('/api/videos/chunk/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ uploadId: initData.uploadId })
+      });
+
+      var doneData = await doneRes.json();
+
+      if (!doneData.success) {
+        throw new Error(doneData.error || 'Gagal menyelesaikan upload');
+      }
+
+      row.status.textContent = 'Selesai';
+      row.status.className = 'text-xs text-green-400 shrink-0';
+      item.done = true;
+      anySuccess = true;
+    }
+
+    async function runQueue() {
+      var pending = queue.filter(function (item) { return !item.done; });
+
+      if (pending.length === 0) {
+        alert('Pilih file video dulu.');
+        return;
+      }
+
+      busy = true;
+      startBtn.disabled = true;
+      startBtn.classList.add('opacity-60', 'cursor-not-allowed');
+
+      for (var i = 0; i < pending.length; i++) {
+        try {
+          await uploadOne(pending[i]);
+        } catch (error) {
+          console.error('Upload error:', error);
+          pending[i].row.status.textContent = 'Gagal';
+          pending[i].row.status.className = 'text-xs text-red-400 shrink-0';
+          alert('Upload gagal: ' + error.message);
+        }
+      }
+
+      busy = false;
+      startBtn.disabled = false;
+      startBtn.classList.remove('opacity-60', 'cursor-not-allowed');
+
+      if (anySuccess) location.reload();
+    }
+
+    document.querySelectorAll('.js-open-upload').forEach(function (btn) {
+      btn.addEventListener('click', openModal);
+    });
+
+    document.getElementById('uploadCloseBtn').addEventListener('click', closeModal);
+    document.getElementById('uploadCancelBtn').addEventListener('click', closeModal);
+
+    modal.addEventListener('click', function (e) {
+      if (e.target === modal) closeModal();
+    });
+
+    dropZone.addEventListener('click', function () { fileInput.click(); });
+
+    fileInput.addEventListener('change', function () {
+      addFiles(fileInput.files);
+      fileInput.value = '';
+    });
+
+    ['dragenter', 'dragover'].forEach(function (evt) {
+      dropZone.addEventListener(evt, function (e) {
+        e.preventDefault();
+        dropZone.classList.add('border-primary');
+      });
+    });
+
+    ['dragleave', 'drop'].forEach(function (evt) {
+      dropZone.addEventListener(evt, function (e) {
+        e.preventDefault();
+        dropZone.classList.remove('border-primary');
+      });
+    });
+
+    dropZone.addEventListener('drop', function (e) {
+      if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
+    });
+
+    startBtn.addEventListener('click', runQueue);
+
+    window.addEventListener('beforeunload', function (e) {
+      if (busy) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    });
   })();
 </script>
