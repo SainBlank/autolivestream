@@ -25,6 +25,20 @@ const bcrypt = require('bcrypt');
 const { v4: uuidv4 } = require('uuid');
 const ffmpeg = require('fluent-ffmpeg');
 
+// BUGFIX v2.4.2:
+// normalizeFolderId() dipakai di 7 endpoint di file ini (upload video, upload
+// audio, chunk/init, dan 4 endpoint impor cloud) tetapi definisinya HILANG saat
+// porting -- fungsi ini hanya ada di userRoutes.js. Akibatnya setiap upload
+// melempar ReferenceError yang tertangkap blok catch, sehingga user hanya melihat
+// pesan umum seperti "Failed to initialize upload".
+// Definisi di bawah harus tetap identik dengan userRoutes.js:116.
+function normalizeFolderId(folderId) {
+  if (folderId === undefined || folderId === null || folderId === '' || folderId === 'root' || folderId === 'null') {
+    return null;
+  }
+  return folderId;
+}
+
 router.post('/upload/video', isAuthenticated, uploadVideo.single('video'), async (req, res) => {
   try {
     console.log('Upload request received:', req.file);
