@@ -887,6 +887,282 @@ router.delete('/api/settings/youtube-channel/:id', isAuthenticated, async (req, 
   }
 });
 
+/* =========================================================================
+ * FACEBOOK LIVE INTEGRATION
+ * Pola sengaja dibuat mirip route YouTube di atas supaya mudah dirawat.
+ * ========================================================================= */
+
+const facebookService = require('../services/facebookService');
+const FacebookTarget = require('../models/FacebookTarget');
+
+/**
+ * Bangun URL absolut yang menghormati reverse proxy (Nginx / Cloudflare).
+ * Wajib sama persis dengan "Valid OAuth Redirect URI" di Facebook App.
+ */
+function buildAbsoluteUrl(req, pathname) {
+  const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+  const host = req.headers['x-forwarded-host'] || req.get('host');
+  return `${protocol}://${host}${pathname}`;
+}
+
+/** Jangan pernah kirim access token ke browser. */
+function sanitizeFacebookTarget(target) {
+  return {
+    id: target.id,
+    target_type: target.target_type,
+    target_id: target.target_id,
+    target_name: target.target_name,
+    target_thumbnail: target.target_thumbnail,
+    follower_count: target.follower_count,
+    is_default: !!target.is_default,
+    created_at: target.created_at
+  };
+}
+
+router.post('/api/settings/facebook-credentials', isAuthenticated, [
+  body('appId').notEmpty().withMessage('App ID is required'),
+  body('appSecret').notEmpty().withMessage('App Secret is required'),
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: errors.array()[0].msg
+      });
+    }
+
+    const { appId, appSecret } = req.body;
+
+    await facebookService.saveAppCredentials(req.session.userId, {
+      appId: String(appId).trim(),
+      appSecret: String(appSecret).trim()
+    });
+
+    return res.json({
+      success: true,
+      message: 'Facebook App credentials saved successfully!'
+    });
+  } catch (error) {
+    console.error('Error saving Facebook credentials:', error);
+    res.status(500).json({
+      success: false,
+      error: 'An error occurred while saving your Facebook credentials'
+    });
+  }
+});
+
+router.get('/api/settings/facebook-status', isAuthenticated, async (req, res) => {
+  try {
+    const user = await User.findById(req.session.userId);
+    const targets = await FacebookTarget.findAll(req.session.userId);
+
+    res.json({
+      success: true,
+      hasCredentials: !!(user.facebook_app_id && user.facebook_app_secret),
+      isConnected: targets.length > 0,
+      pageCount: targets.length,
+      pages: targets.map(sanitizeFacebookTarget),
+      tokenExpiresAt: user.facebook_token_expires_at || null
+    });
+  } catch (error) {
+    console.error('Error checking Facebook status:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to check Facebook status'
+    });
+  }
+});
+
+router.get('/api/settings/facebook-pages', isAuthenticated, async (req, res) => {
+  try {
+    const targets = await FacebookTarget.findAll(req.session.userId);
+    res.json({ success: true, pages: targets.map(sanitizeFacebookTarget) });
+  } catch (error) {
+    console.error('Error fetching Facebook pages:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch Facebook pages' });
+  }
+});
+
+router.post('/api/settings/facebook-page/:id/default', isAuthenticated, async (req, res) => {
+  try {
+    const target = await FacebookTarget.findById(req.params.id);
+
+    if (!target || target.user_id !== req.session.userId) {
+      return res.status(404).json({ success: false, error: 'Facebook Page not found' });
+    }
+
+    await FacebookTarget.setDefault(req.session.userId, req.params.id);
+    res.json({ success: true, message: 'Default Facebook Page updated' });
+  } catch (error) {
+    console.error('Error setting default Facebook Page:', error);
+    res.status(500).json({ success: false, error: 'Failed to set default Facebook Page' });
+  }
+});
+
+router.delete('/api/settings/facebook-page/:id', isAuthenticated, async (req, res) => {
+  try {
+    const target = await FacebookTarget.findById(req.params.id);
+
+    if (!target || target.user_id !== req.session.userId) {
+      return res.status(404).json({ success: false, error: 'Facebook Page not found' });
+    }
+
+    await FacebookTarget.delete(req.params.id, req.session.userId);
+
+    // Pastikan selalu ada satu Page default bila masih ada Page tersisa.
+    if (target.is_default) {
+      const remaining = await FacebookTarget.findAll(req.session.userId);
+      if (remaining.length > 0) {
+        await FacebookTarget.setDefault(req.session.userId, remaining[0].id);
+      }
+    }
+
+    res.json({ success: true, message: 'Facebook Page disconnected successfully' });
+  } catch (error) {
+    console.error('Error disconnecting Facebook Page:', error);
+    res.status(500).json({ success: false, error: 'Failed to disconnect Facebook Page' });
+  }
+});
+
+router.post('/api/settings/facebook-disconnect', isAuthenticated, async (req, res) => {
+  try {
+    await FacebookTarget.deleteAll(req.session.userId);
+    await User.update(req.session.userId, {
+      facebook_user_token: null,
+      facebook_token_expires_at: null
+    });
+
+    res.json({ success: true, message: 'All Facebook Pages disconnected successfully' });
+  } catch (error) {
+    console.error('Error disconnecting Facebook:', error);
+    res.status(500).json({ success: false, error: 'Failed to disconnect Facebook account' });
+  }
+});
+
+router.get('/auth/facebook', isAuthenticated, async (req, res) => {
+  try {
+    const credentials = await facebookService.getAppCredentials(req.session.userId);
+
+    if (!credentials) {
+      return res.redirect('/settings?error=Please save your Facebook App credentials first&activeTab=integration');
+    }
+
+    const redirectUri = buildAbsoluteUrl(req, '/auth/facebook/callback');
+
+    const authUrl = facebookService.buildAuthUrl({
+      appId: credentials.appId,
+      redirectUri,
+      state: req.session.userId
+    });
+
+    res.redirect(authUrl);
+  } catch (error) {
+    console.error('Facebook OAuth error:', error);
+    res.redirect('/settings?error=Failed to initiate Facebook authentication&activeTab=integration');
+  }
+});
+
+router.get('/auth/facebook/callback', isAuthenticated, async (req, res) => {
+  try {
+    const { code, state, error, error_description: errorDescription } = req.query;
+
+    if (error) {
+      const message = errorDescription || error;
+      console.error('Facebook OAuth error:', message);
+      return res.redirect(`/settings?error=${encodeURIComponent(message)}&activeTab=integration`);
+    }
+
+    if (!code) {
+      return res.redirect('/settings?error=No authorization code received&activeTab=integration');
+    }
+
+    // Lindungi dari CSRF: state harus milik sesi yang sedang berjalan.
+    if (state && state !== req.session.userId) {
+      return res.redirect('/settings?error=Invalid OAuth state&activeTab=integration');
+    }
+
+    const credentials = await facebookService.getAppCredentials(req.session.userId);
+
+    if (!credentials) {
+      return res.redirect('/settings?error=Facebook App credentials not found&activeTab=integration');
+    }
+
+    const redirectUri = buildAbsoluteUrl(req, '/auth/facebook/callback');
+
+    const shortLived = await facebookService.exchangeCodeForToken({
+      appId: credentials.appId,
+      appSecret: credentials.appSecret,
+      redirectUri,
+      code
+    });
+
+    // Long-lived user token (~60 hari) supaya Page token tidak cepat mati.
+    const longLived = await facebookService.exchangeForLongLivedToken({
+      appId: credentials.appId,
+      appSecret: credentials.appSecret,
+      accessToken: shortLived.accessToken
+    });
+
+    const pages = await facebookService.listPages(longLived.accessToken);
+
+    if (pages.length === 0) {
+      return res.redirect('/settings?error=No Facebook Page found for this account&activeTab=integration');
+    }
+
+    const expiresAt = longLived.expiresIn
+      ? new Date(Date.now() + (longLived.expiresIn * 1000)).toISOString()
+      : null;
+
+    await User.update(req.session.userId, {
+      facebook_user_token: encrypt(longLived.accessToken),
+      facebook_token_expires_at: expiresAt
+    });
+
+    let saved = 0;
+
+    for (const page of pages) {
+      if (!page.canPublish) {
+        continue;
+      }
+
+      const existing = await FacebookTarget.findByTargetId(req.session.userId, page.id);
+
+      const payload = {
+        target_name: page.name,
+        target_thumbnail: page.picture,
+        follower_count: page.followerCount,
+        access_token: encrypt(page.accessToken),
+        token_expires_at: expiresAt
+      };
+
+      if (existing) {
+        await FacebookTarget.update(existing.id, payload);
+      } else {
+        await FacebookTarget.create({
+          user_id: req.session.userId,
+          target_type: 'page',
+          target_id: page.id,
+          ...payload
+        });
+      }
+
+      saved++;
+    }
+
+    if (saved === 0) {
+      return res.redirect('/settings?error=No Facebook Page with publishing permission was found&activeTab=integration');
+    }
+
+    const message = `Facebook connected successfully (${saved} Page)`;
+    return res.redirect(`/settings?success=${encodeURIComponent(message)}&activeTab=integration`);
+  } catch (error) {
+    console.error('Facebook OAuth callback error:', error);
+    const message = error.message || 'Failed to complete Facebook authentication';
+    return res.redirect(`/settings?error=${encodeURIComponent(message)}&activeTab=integration`);
+  }
+});
+
 const { google } = require('googleapis');
 
 function getYouTubeOAuth2Client(clientId, clientSecret, redirectUri) {
@@ -1903,6 +2179,391 @@ router.post('/api/streams/youtube', isAuthenticated, uploadThumbnail.single('thu
   }
 });
 
+/* =========================================================================
+ * STREAM CREATION: FACEBOOK & MULTI-PLATFORM (SIMULCAST)
+ * ========================================================================= */
+
+const StreamTarget = require('../models/StreamTarget');
+const {
+  PLATFORMS,
+  STREAM_MODES,
+  resolveSafeBitrate,
+  detectPlatformFromUrl
+} = require('../utils/platformRegistry');
+
+/**
+ * Parse "2026-08-23T20:30" sebagai waktu LOKAL server (bukan UTC),
+ * sama seperti perilaku route stream yang sudah ada.
+ */
+function parseLocalScheduleTime(value) {
+  if (!value) return null;
+  const [datePart, timePart] = String(value).split('T');
+  if (!datePart || !timePart) return null;
+  const [year, month, day] = datePart.split('-').map(Number);
+  const [hours, minutes] = timePart.split(':').map(Number);
+  return new Date(year, month - 1, day, hours, minutes);
+}
+
+function applyScheduleToStreamData(streamData, scheduleStartTime, scheduleEndTime) {
+  const startDate = parseLocalScheduleTime(scheduleStartTime);
+  const endDate = parseLocalScheduleTime(scheduleEndTime);
+
+  if (startDate) {
+    streamData.schedule_time = startDate.toISOString();
+    streamData.status = 'scheduled';
+  } else {
+    streamData.status = 'offline';
+  }
+
+  if (endDate) {
+    if (startDate && endDate <= startDate) {
+      return { error: 'End time must be after start time' };
+    }
+
+    streamData.end_time = endDate.toISOString();
+
+    if (startDate) {
+      const durationMinutes = Math.round((endDate - startDate) / (1000 * 60));
+      streamData.duration = durationMinutes > 0 ? durationMinutes : null;
+    }
+  }
+
+  return { error: null };
+}
+
+/**
+ * Buat live Facebook otomatis lewat Graph API.
+ * Stream key TIDAK diminta dari user; dibuat saat stream mulai.
+ */
+router.post('/api/streams/facebook', isAuthenticated, uploadThumbnail.single('thumbnail'), async (req, res) => {
+  try {
+    const {
+      videoId,
+      title,
+      description,
+      privacy,
+      loopVideo,
+      scheduleStartTime,
+      scheduleEndTime,
+      fbTargetId,
+      bitrate,
+      resolution,
+      fps
+    } = req.body;
+
+    if (!videoId) {
+      return res.status(400).json({ success: false, error: 'Video is required' });
+    }
+
+    if (!title) {
+      return res.status(400).json({ success: false, error: 'Stream title is required' });
+    }
+
+    const credentials = await facebookService.getAppCredentials(req.session.userId);
+
+    if (!credentials) {
+      return res.status(400).json({
+        success: false,
+        error: 'Facebook App credentials not configured. Buka Settings > Integration.'
+      });
+    }
+
+    const selectedTarget = await FacebookTarget.resolveTarget(req.session.userId, fbTargetId || null);
+
+    if (!selectedTarget) {
+      return res.status(400).json({
+        success: false,
+        error: 'Facebook Page belum terhubung. Hubungkan Page di Settings > Integration.'
+      });
+    }
+
+    // Facebook menolak bitrate tinggi, jadi dipangkas di sini juga (defense in depth).
+    const requestedBitrate = parseInt(bitrate, 10) || 4000;
+    const safeBitrate = resolveSafeBitrate(requestedBitrate, [{ platform: 'facebook' }]);
+
+    const streamData = {
+      title,
+      video_id: videoId,
+      rtmp_url: '',
+      stream_key: '',
+      platform: 'Facebook',
+      platform_icon: 'ti-brand-facebook',
+      bitrate: safeBitrate.bitrate,
+      resolution: resolution || '1920x1080',
+      fps: parseInt(fps, 10) || 30,
+      orientation: 'horizontal',
+      loop_video: loopVideo === 'true' || loopVideo === true,
+      use_advanced_settings: false,
+      user_id: req.session.userId,
+      stream_mode: STREAM_MODES.SINGLE,
+      is_facebook_api: true,
+      facebook_target_id: selectedTarget.id,
+      facebook_description: description || '',
+      facebook_privacy: privacy || 'EVERYONE'
+    };
+
+    const scheduleResult = applyScheduleToStreamData(streamData, scheduleStartTime, scheduleEndTime);
+
+    if (scheduleResult.error) {
+      return res.status(400).json({ success: false, error: scheduleResult.error });
+    }
+
+    const stream = await Stream.create(streamData);
+
+    await StreamTarget.create({
+      stream_id: stream.id,
+      platform: 'facebook',
+      platform_icon: 'ti-brand-facebook',
+      mode: 'api',
+      facebook_target_id: selectedTarget.id,
+      title,
+      description: description || null,
+      privacy: privacy || 'EVERYONE',
+      order_index: 0
+    });
+
+    res.json({
+      success: true,
+      stream,
+      message: 'Stream dibuat. Live video Facebook akan dibuat saat stream dimulai.'
+    });
+  } catch (error) {
+    console.error('Error creating Facebook stream:', error);
+    res.status(500).json({ success: false, error: error.message || 'Failed to create Facebook stream' });
+  }
+});
+
+/**
+ * Buat stream dengan beberapa tujuan sekaligus (simulcast).
+ *
+ * Body:
+ *   targets: JSON array, mis.
+ *     [{ "platform": "youtube", "mode": "api", "channelId": "..." },
+ *      { "platform": "facebook", "mode": "api", "targetId": "..." }]
+ *   atau mode manual: { "platform": "custom", "mode": "manual", "rtmpUrl": "...", "streamKey": "..." }
+ *
+ * Hanya SATU proses FFmpeg yang dijalankan; video di-encode sekali lalu
+ * dikirim ke semua tujuan memakai muxer `tee`.
+ */
+router.post('/api/streams/multi', isAuthenticated, uploadThumbnail.single('thumbnail'), async (req, res) => {
+  try {
+    const {
+      videoId,
+      title,
+      description,
+      privacy,
+      loopVideo,
+      scheduleStartTime,
+      scheduleEndTime,
+      bitrate,
+      resolution,
+      fps,
+      orientation,
+      useAdvancedSettings
+    } = req.body;
+
+    if (!videoId) {
+      return res.status(400).json({ success: false, error: 'Video is required' });
+    }
+
+    if (!title) {
+      return res.status(400).json({ success: false, error: 'Stream title is required' });
+    }
+
+    let requestedTargets = req.body.targets;
+
+    if (typeof requestedTargets === 'string') {
+      try {
+        requestedTargets = JSON.parse(requestedTargets);
+      } catch (parseError) {
+        return res.status(400).json({ success: false, error: 'Format targets tidak valid (harus JSON array)' });
+      }
+    }
+
+    if (!Array.isArray(requestedTargets) || requestedTargets.length === 0) {
+      return res.status(400).json({ success: false, error: 'Pilih minimal satu platform tujuan' });
+    }
+
+    const YoutubeChannel = require('../models/YoutubeChannel');
+    const preparedTargets = [];
+    const platformKeys = [];
+
+    let youtubeChannelId = null;
+    let facebookTargetId = null;
+    let legacyRtmpUrl = '';
+    let legacyStreamKey = '';
+
+    for (let index = 0; index < requestedTargets.length; index++) {
+      const entry = requestedTargets[index] || {};
+      const platformKey = String(entry.platform || '').toLowerCase();
+      const mode = entry.mode === 'api' ? 'api' : 'manual';
+      const platformMeta = PLATFORMS[platformKey] || PLATFORMS.custom;
+
+      if (platformKey === 'youtube' && mode === 'api') {
+        let channel = entry.channelId
+          ? await YoutubeChannel.findById(entry.channelId)
+          : await YoutubeChannel.findDefault(req.session.userId);
+
+        if (!channel) {
+          const channels = await YoutubeChannel.findAll(req.session.userId);
+          channel = channels[0];
+        }
+
+        if (!channel || channel.user_id !== req.session.userId) {
+          return res.status(400).json({ success: false, error: 'Channel YouTube tidak valid atau belum terhubung' });
+        }
+
+        if (!channel.access_token || !channel.refresh_token) {
+          return res.status(400).json({ success: false, error: 'Akun YouTube belum terhubung. Hubungkan di Settings.' });
+        }
+
+        youtubeChannelId = channel.id;
+
+        preparedTargets.push({
+          platform: 'youtube',
+          platform_icon: 'ti-brand-youtube',
+          mode: 'api',
+          youtube_channel_id: channel.id,
+          title,
+          description: description || null,
+          privacy: entry.privacy || privacy || 'unlisted',
+          category: entry.category || '22',
+          tags: entry.tags || null,
+          monetization: entry.monetization === true || entry.monetization === 'true',
+          order_index: index
+        });
+        platformKeys.push('youtube');
+        continue;
+      }
+
+      if (platformKey === 'facebook' && mode === 'api') {
+        const credentials = await facebookService.getAppCredentials(req.session.userId);
+
+        if (!credentials) {
+          return res.status(400).json({
+            success: false,
+            error: 'Facebook App credentials belum diisi. Buka Settings > Integration.'
+          });
+        }
+
+        const fbTarget = await FacebookTarget.resolveTarget(req.session.userId, entry.targetId || null);
+
+        if (!fbTarget) {
+          return res.status(400).json({
+            success: false,
+            error: 'Facebook Page belum terhubung. Hubungkan Page di Settings > Integration.'
+          });
+        }
+
+        facebookTargetId = fbTarget.id;
+
+        preparedTargets.push({
+          platform: 'facebook',
+          platform_icon: 'ti-brand-facebook',
+          mode: 'api',
+          facebook_target_id: fbTarget.id,
+          title,
+          description: description || null,
+          privacy: entry.privacy || 'EVERYONE',
+          order_index: index
+        });
+        platformKeys.push('facebook');
+        continue;
+      }
+
+      // Mode manual: butuh RTMP URL + stream key dari user.
+      const rtmpUrl = String(entry.rtmpUrl || '').trim();
+      const streamKey = String(entry.streamKey || '').trim();
+
+      if (!rtmpUrl || !streamKey) {
+        return res.status(400).json({
+          success: false,
+          error: `RTMP URL dan stream key wajib diisi untuk tujuan manual (${platformMeta.label})`
+        });
+      }
+
+      const detected = platformKey ? platformMeta : detectPlatformFromUrl(rtmpUrl);
+
+      if (!legacyRtmpUrl) {
+        legacyRtmpUrl = rtmpUrl;
+        legacyStreamKey = streamKey;
+      }
+
+      preparedTargets.push({
+        platform: detected.key,
+        platform_icon: detected.icon || 'ti-broadcast',
+        mode: 'manual',
+        rtmp_url: rtmpUrl,
+        stream_key: streamKey,
+        title,
+        order_index: index
+      });
+      platformKeys.push(detected.key);
+    }
+
+    const isMulti = preparedTargets.length > 1;
+
+    const bitrateTargets = preparedTargets.map((target) => ({ platform: target.platform }));
+    const requestedBitrate = parseInt(bitrate, 10) || 2500;
+    const safeBitrate = resolveSafeBitrate(requestedBitrate, bitrateTargets);
+
+    const primaryPlatform = PLATFORMS[platformKeys[0]] || PLATFORMS.custom;
+
+    const streamData = {
+      title,
+      video_id: videoId,
+      rtmp_url: legacyRtmpUrl,
+      stream_key: legacyStreamKey,
+      platform: isMulti
+        ? platformKeys.map((key) => (PLATFORMS[key] || PLATFORMS.custom).label).join(' + ')
+        : primaryPlatform.label,
+      platform_icon: isMulti ? 'ti-broadcast' : (primaryPlatform.icon || 'ti-broadcast'),
+      bitrate: safeBitrate.bitrate,
+      resolution: resolution || '1280x720',
+      fps: parseInt(fps, 10) || 30,
+      orientation: orientation || 'horizontal',
+      loop_video: loopVideo === 'true' || loopVideo === true,
+      use_advanced_settings: useAdvancedSettings === 'true' || useAdvancedSettings === true,
+      user_id: req.session.userId,
+      stream_mode: isMulti ? STREAM_MODES.MULTI : STREAM_MODES.SINGLE,
+      is_multi_platform: isMulti,
+      is_youtube_api: platformKeys.includes('youtube') && preparedTargets.some((t) => t.platform === 'youtube' && t.mode === 'api'),
+      is_facebook_api: platformKeys.includes('facebook') && preparedTargets.some((t) => t.platform === 'facebook' && t.mode === 'api'),
+      youtube_channel_id: youtubeChannelId,
+      youtube_description: description || '',
+      youtube_privacy: privacy || 'unlisted',
+      facebook_target_id: facebookTargetId,
+      facebook_description: description || '',
+      facebook_privacy: 'EVERYONE'
+    };
+
+    const scheduleResult = applyScheduleToStreamData(streamData, scheduleStartTime, scheduleEndTime);
+
+    if (scheduleResult.error) {
+      return res.status(400).json({ success: false, error: scheduleResult.error });
+    }
+
+    const stream = await Stream.create(streamData);
+
+    for (const target of preparedTargets) {
+      await StreamTarget.create({ ...target, stream_id: stream.id });
+    }
+
+    res.json({
+      success: true,
+      stream,
+      targets: preparedTargets.map((target) => ({ platform: target.platform, mode: target.mode })),
+      bitrateCapped: safeBitrate.capped,
+      message: safeBitrate.capped
+        ? `Stream dibuat. Bitrate disesuaikan ke ${safeBitrate.bitrate} kbps agar aman untuk semua platform.`
+        : 'Stream dibuat.'
+    });
+  } catch (error) {
+    console.error('Error creating multi-platform stream:', error);
+    res.status(500).json({ success: false, error: error.message || 'Failed to create multi-platform stream' });
+  }
+});
+
 router.get('/api/streams/:id', isAuthenticated, async (req, res) => {
   try {
     const stream = await Stream.getStreamWithVideo(req.params.id);
@@ -1947,7 +2608,30 @@ router.get('/api/streams/:id', isAuthenticated, async (req, res) => {
         console.log('Note: Could not fetch YouTube thumbnail:', ytError.message);
       }
     }
-    
+
+    // Daftar tujuan (YouTube / Facebook / manual) untuk mode single & simulcast.
+    try {
+      const targets = await StreamTarget.findByStream(req.params.id);
+      stream.targets = targets.map((target) => ({
+        id: target.id,
+        platform: target.platform,
+        platform_icon: target.platform_icon,
+        mode: target.mode,
+        rtmp_url: target.rtmp_url,
+        stream_key: target.stream_key,
+        is_enabled: target.is_enabled,
+        status: target.status,
+        last_error: target.last_error,
+        youtube_channel_id: target.youtube_channel_id,
+        facebook_target_id: target.facebook_target_id,
+        facebook_permalink: target.facebook_permalink,
+        order_index: target.order_index
+      }));
+    } catch (targetError) {
+      console.log('Note: Could not load stream targets:', targetError.message);
+      stream.targets = [];
+    }
+
     res.json({ success: true, stream });
   } catch (error) {
     console.error('Error fetching stream:', error);

@@ -8,6 +8,15 @@ const db = require('../models/database');
 const Stream = require('../models/Stream');
 const Playlist = require('../models/Playlist');
 const Video = require('../models/Video');
+const StreamTarget = require('../models/StreamTarget');
+const {
+  resolveTargetPlatform,
+  detectPlatformFromUrl,
+  buildIngestUrl,
+  resolveSafeBitrate,
+  resolveKeyframeIntervalSeconds,
+  resolveAudioSampleRate
+} = require('../utils/platformRegistry');
 
 let ffmpegPath;
 if (fs.existsSync('/usr/bin/ffmpeg')) {
@@ -48,6 +57,80 @@ const STREAM_START_TIMEOUT = 15000;
 
 const YOUTUBE_COPY_ALLOWED_VIDEO_CODECS = new Set(['h264']);
 const YOUTUBE_COPY_ALLOWED_AUDIO_CODECS = new Set(['aac', 'mp3']);
+
+const DEFAULT_COPY_CONSTRAINTS = {
+  videoCodecs: YOUTUBE_COPY_ALLOWED_VIDEO_CODECS,
+  audioCodecs: YOUTUBE_COPY_ALLOWED_AUDIO_CODECS,
+  platformLabel: 'YouTube'
+};
+
+/**
+ * Bangun daftar target "implisit" dari kolom lama tabel streams.
+ * Dipakai sebagai fallback agar kode lama (dan endpoint validasi yang hanya
+ * mengirim rtmpUrl) tetap bekerja tanpa baris stream_targets.
+ */
+function buildImplicitTargets({ isYouTubeApi = false, isFacebookApi = false, rtmpUrl = '' } = {}) {
+  if (isYouTubeApi) {
+    return [{ platform: 'youtube', rtmp_url: rtmpUrl }];
+  }
+
+  if (isFacebookApi) {
+    return [{ platform: 'facebook', rtmp_url: rtmpUrl }];
+  }
+
+  return [{ platform: detectPlatformFromUrl(rtmpUrl).key, rtmp_url: rtmpUrl }];
+}
+
+/**
+ * Aturan copy mode gabungan untuk sekumpulan target.
+ *
+ * Saat simulcast, satu bitstream dikirim ke semua platform sekaligus, jadi
+ * media sumber harus memenuhi aturan TERKETAT dari semua platform tujuan
+ * (irisan himpunan codec). Contoh nyata: video dengan audio MP3 aman di
+ * YouTube, tetapi akan ditolak Facebook, sehingga harus di-re-encode.
+ *
+ * @returns {null|{videoCodecs:Set,audioCodecs:Set,platformLabel:string}}
+ *          null berarti tidak ada aturan ketat (mis. custom RTMP saja).
+ */
+function getCopyConstraintsForTargets(targets) {
+  const list = (targets || []).filter(Boolean);
+
+  let videoCodecs = null;
+  let audioCodecs = null;
+  const labels = [];
+
+  for (const target of list) {
+    const platform = resolveTargetPlatform(target);
+
+    // Custom RTMP tidak punya aturan yang bisa kita pastikan.
+    if (platform.key === 'custom') {
+      continue;
+    }
+
+    labels.push(platform.label);
+
+    const platformVideo = new Set((platform.allowedCopyVideoCodecs || []).map((c) => c.toLowerCase()));
+    const platformAudio = new Set((platform.allowedCopyAudioCodecs || []).map((c) => c.toLowerCase()));
+
+    videoCodecs = videoCodecs
+      ? new Set([...videoCodecs].filter((codec) => platformVideo.has(codec)))
+      : platformVideo;
+
+    audioCodecs = audioCodecs
+      ? new Set([...audioCodecs].filter((codec) => platformAudio.has(codec)))
+      : platformAudio;
+  }
+
+  if (labels.length === 0) {
+    return null;
+  }
+
+  return {
+    videoCodecs,
+    audioCodecs,
+    platformLabel: [...new Set(labels)].join(' + ')
+  };
+}
 
 let schedulerService = null;
 let syncIntervalId = null;
@@ -137,8 +220,8 @@ function getFrameRateLabel(videoStream) {
   return videoStream && videoStream.avg_frame_rate ? videoStream.avg_frame_rate : 'unknown fps';
 }
 
-function buildCopyModeCompatibilityError(label, detail) {
-  return `${label} tidak kompatibel dengan YouTube: ${detail}.`;
+function buildCopyModeCompatibilityError(label, detail, platformLabel = 'YouTube') {
+  return `${label} tidak kompatibel dengan ${platformLabel}: ${detail}.`;
 }
 
 function createUnsupportedCopyModeError(message) {
@@ -218,41 +301,63 @@ function runFFprobe(filePath) {
   });
 }
 
-function validateYouTubeCopyVideoProbe(probeData, label) {
+function validateYouTubeCopyVideoProbe(probeData, label, constraints = DEFAULT_COPY_CONSTRAINTS) {
+  const rules = constraints || DEFAULT_COPY_CONSTRAINTS;
+  const platformLabel = rules.platformLabel || 'YouTube';
+
   const videoStream = getPrimaryStream(probeData, 'video');
   if (!videoStream) {
-    return buildCopyModeCompatibilityError(label, 'video stream tidak ditemukan');
+    return buildCopyModeCompatibilityError(label, 'video stream tidak ditemukan', platformLabel);
   }
 
   const videoCodec = (videoStream.codec_name || '').toLowerCase();
-  if (!YOUTUBE_COPY_ALLOWED_VIDEO_CODECS.has(videoCodec)) {
-    return buildCopyModeCompatibilityError(label, `codec video ${videoCodec || 'unknown'} tidak didukung`);
+  if (!rules.videoCodecs.has(videoCodec)) {
+    return buildCopyModeCompatibilityError(
+      label,
+      `codec video ${videoCodec || 'unknown'} tidak didukung (butuh ${[...rules.videoCodecs].join('/')})`,
+      platformLabel
+    );
   }
 
   if (!isSupportedYouTubePixelFormat(videoStream.pix_fmt)) {
-    return buildCopyModeCompatibilityError(label, `pixel format ${videoStream.pix_fmt || 'unknown'} bukan 4:2:0 standar`);
+    return buildCopyModeCompatibilityError(
+      label,
+      `pixel format ${videoStream.pix_fmt || 'unknown'} bukan 4:2:0 standar`,
+      platformLabel
+    );
   }
 
   const audioStream = getPrimaryStream(probeData, 'audio');
   if (audioStream) {
     const audioCodec = (audioStream.codec_name || '').toLowerCase();
-    if (!YOUTUBE_COPY_ALLOWED_AUDIO_CODECS.has(audioCodec)) {
-      return buildCopyModeCompatibilityError(label, `codec audio ${audioCodec || 'unknown'} tidak didukung`);
+    if (!rules.audioCodecs.has(audioCodec)) {
+      return buildCopyModeCompatibilityError(
+        label,
+        `codec audio ${audioCodec || 'unknown'} tidak didukung (butuh ${[...rules.audioCodecs].join('/')})`,
+        platformLabel
+      );
     }
   }
 
   return null;
 }
 
-function validateYouTubeCopyAudioProbe(probeData, label) {
+function validateYouTubeCopyAudioProbe(probeData, label, constraints = DEFAULT_COPY_CONSTRAINTS) {
+  const rules = constraints || DEFAULT_COPY_CONSTRAINTS;
+  const platformLabel = rules.platformLabel || 'YouTube';
+
   const audioStream = getPrimaryStream(probeData, 'audio');
   if (!audioStream) {
-    return buildCopyModeCompatibilityError(label, 'audio stream tidak ditemukan');
+    return buildCopyModeCompatibilityError(label, 'audio stream tidak ditemukan', platformLabel);
   }
 
   const audioCodec = (audioStream.codec_name || '').toLowerCase();
-  if (!YOUTUBE_COPY_ALLOWED_AUDIO_CODECS.has(audioCodec)) {
-    return buildCopyModeCompatibilityError(label, `codec audio ${audioCodec || 'unknown'} tidak didukung`);
+  if (!rules.audioCodecs.has(audioCodec)) {
+    return buildCopyModeCompatibilityError(
+      label,
+      `codec audio ${audioCodec || 'unknown'} tidak didukung (butuh ${[...rules.audioCodecs].join('/')})`,
+      platformLabel
+    );
   }
 
   return null;
@@ -281,15 +386,17 @@ function validatePlaylistCopyConsistency(referenceStream, currentStream, label) 
     return null;
   }
 
-  return `${label} tidak bisa digabung aman di copy mode YouTube karena ${mismatches.join(', ')}.`;
+  return `${label} tidak bisa digabung aman di copy mode karena ${mismatches.join(', ')}.`;
 }
 
-async function validateCopyModeCompatibility(stream) {
+async function validateCopyModeCompatibility(stream, targets = null) {
   return validateCopyModeCompatibilityForInput({
     videoId: stream.video_id,
     useAdvancedSettings: stream.use_advanced_settings,
     isYouTubeApi: stream.is_youtube_api,
-    rtmpUrl: stream.rtmp_url
+    isFacebookApi: stream.is_facebook_api,
+    rtmpUrl: stream.rtmp_url,
+    targets
   });
 }
 
@@ -297,9 +404,22 @@ async function validateCopyModeCompatibilityForInput({
   videoId,
   useAdvancedSettings = false,
   isYouTubeApi = false,
-  rtmpUrl = ''
+  isFacebookApi = false,
+  rtmpUrl = '',
+  targets = null
 }) {
-  if (useAdvancedSettings || !isYouTubeDestination({ is_youtube_api: isYouTubeApi, rtmp_url: rtmpUrl })) {
+  if (useAdvancedSettings) {
+    return;
+  }
+
+  const effectiveTargets = (targets && targets.length > 0)
+    ? targets
+    : buildImplicitTargets({ isYouTubeApi, isFacebookApi, rtmpUrl });
+
+  const constraints = getCopyConstraintsForTargets(effectiveTargets);
+
+  // Tidak ada platform dengan aturan pasti (mis. custom RTMP saja) => lewati.
+  if (!constraints) {
     return;
   }
 
@@ -316,7 +436,7 @@ async function validateCopyModeCompatibilityForInput({
       const video = playlist.videos[index];
       const probeData = await runFFprobe(resolvePublicFilePath(video.filepath));
       const label = buildMediaLabel(video, index, 'Video');
-      const compatibilityError = validateYouTubeCopyVideoProbe(probeData, label);
+      const compatibilityError = validateYouTubeCopyVideoProbe(probeData, label, constraints);
 
       if (compatibilityError) {
         throw createUnsupportedCopyModeError(compatibilityError);
@@ -337,7 +457,7 @@ async function validateCopyModeCompatibilityForInput({
       const audio = playlist.audios[index];
       const probeData = await runFFprobe(resolvePublicFilePath(audio.filepath));
       const label = buildMediaLabel(audio, index, 'Audio');
-      const compatibilityError = validateYouTubeCopyAudioProbe(probeData, label);
+      const compatibilityError = validateYouTubeCopyAudioProbe(probeData, label, constraints);
 
       if (compatibilityError) {
         throw createUnsupportedCopyModeError(compatibilityError);
@@ -354,12 +474,89 @@ async function validateCopyModeCompatibilityForInput({
 
   const compatibilityError = validateYouTubeCopyVideoProbe(
     await runFFprobe(resolvePublicFilePath(video.filepath)),
-    buildMediaLabel(video, 0, 'Video')
+    buildMediaLabel(video, 0, 'Video'),
+    constraints
   );
 
   if (compatibilityError) {
     throw createUnsupportedCopyModeError(compatibilityError);
   }
+}
+
+/**
+ * Escape URL untuk dipakai di dalam spesifikasi muxer `tee`.
+ * Di dalam tee spec, karakter `|` memisahkan output dan `\` adalah escape,
+ * jadi keduanya wajib di-escape.
+ */
+function escapeTeeUrl(url) {
+  return String(url).replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
+}
+
+/**
+ * Ubah daftar target menjadi URL ingest lengkap.
+ */
+function buildTargetUrls(targets) {
+  return (targets || [])
+    .filter((target) => target && target.rtmp_url && target.stream_key)
+    .map((target) => ({
+      target,
+      url: buildIngestUrl(target.rtmp_url, target.stream_key),
+      platform: resolveTargetPlatform(target)
+    }));
+}
+
+/**
+ * Bangun bagian OUTPUT dari argumen FFmpeg.
+ *
+ * PENTING (kompatibilitas mundur):
+ *  - Jika hanya ada SATU target, output yang dihasilkan identik dengan versi
+ *    aplikasi sebelumnya: `-f flv -flvflags no_duration_filesize <url>`.
+ *    Tidak ada argumen tambahan, sehingga tidak ada risiko regresi.
+ *  - Jika ada DUA target atau lebih, dipakai muxer `tee` sehingga video hanya
+ *    di-encode SEKALI lalu dikirim ke semua platform. Ini jauh lebih ringan
+ *    untuk VPS kecil dibanding menjalankan dua proses FFmpeg.
+ *  - `onfail=ignore` membuat satu platform yang bermasalah tidak mematikan
+ *    stream ke platform lainnya.
+ *
+ * @param {Array} resolvedTargets hasil buildTargetUrls()
+ * @param {object} options
+ * @param {boolean} options.isCopyMode true jika memakai -c:v copy
+ * @param {Array<string>} options.mapArgs argumen -map yang wajib ada saat tee
+ * @param {boolean} options.audioIsAac apakah audio keluaran berformat AAC
+ */
+function buildOutputArgs(resolvedTargets, { isCopyMode = false, mapArgs = [], audioIsAac = true } = {}) {
+  if (!resolvedTargets || resolvedTargets.length === 0) {
+    throw new Error('Tidak ada tujuan streaming yang valid (RTMP URL / stream key kosong)');
+  }
+
+  if (resolvedTargets.length === 1) {
+    return [
+      '-f', 'flv',
+      '-flvflags', 'no_duration_filesize',
+      resolvedTargets[0].url
+    ];
+  }
+
+  // Bitstream filter harus dideklarasikan per-output saat memakai tee.
+  const needsAdtsToAsc = isCopyMode && audioIsAac;
+
+  const teeSpec = resolvedTargets
+    .map(({ url }) => {
+      const options = ['f=flv', 'onfail=ignore', 'flvflags=no_duration_filesize'];
+      if (needsAdtsToAsc) {
+        options.push('bsfs/a=aac_adtstoasc');
+      }
+      return `[${options.join(':')}]${escapeTeeUrl(url)}`;
+    })
+    .join('|');
+
+  return [
+    ...mapArgs,
+    // Diperlukan agar header global ditulis untuk setiap output tee.
+    '-flags', '+global_header',
+    '-f', 'tee',
+    teeSpec
+  ];
 }
 
 function waitForStreamStartup(streamId, ffmpegProcess, startupState) {
@@ -397,13 +594,64 @@ function waitForStreamStartup(streamId, ffmpegProcess, startupState) {
   });
 }
 
-async function buildFFmpegArgsForPlaylist(stream, playlist) {
+/**
+ * Target "legacy" dari kolom lama tabel streams, dipakai bila stream belum
+ * punya baris stream_targets (kompatibilitas dengan data versi lama).
+ */
+function buildLegacyTargetFromStream(stream) {
+  return [{
+    platform: stream.is_facebook_api
+      ? 'facebook'
+      : (stream.is_youtube_api ? 'youtube' : detectPlatformFromUrl(stream.rtmp_url).key),
+    rtmp_url: stream.rtmp_url,
+    stream_key: stream.stream_key
+  }];
+}
+
+function resolveTargetsForArgs(stream, targets) {
+  const source = (targets && targets.length > 0) ? targets : buildLegacyTargetFromStream(stream);
+  const resolved = buildTargetUrls(source);
+
+  if (resolved.length === 0) {
+    throw new Error('Missing RTMP URL or stream key');
+  }
+
+  return resolved;
+}
+
+/**
+ * Parameter encoding efektif setelah mempertimbangkan batas tiap platform.
+ *
+ * Contoh: user memilih 8000 kbps untuk simulcast YouTube + Facebook.
+ * Facebook menolak di atas 4000 kbps, jadi nilai dipangkas otomatis ke 4000
+ * supaya stream tidak terputus di tengah jalan.
+ */
+function resolveEncodingParams(stream, resolvedTargets) {
+  const rawTargets = resolvedTargets.map((item) => item.target);
+  const requestedBitrate = stream.bitrate || 2500;
+  const safe = resolveSafeBitrate(requestedBitrate, rawTargets);
+
+  return {
+    resolution: stream.resolution || '1280x720',
+    bitrate: safe.bitrate || requestedBitrate,
+    fps: stream.fps || 30,
+    keyframeSeconds: resolveKeyframeIntervalSeconds(rawTargets),
+    audioSampleRate: resolveAudioSampleRate(rawTargets),
+    bitrateCapped: safe.capped,
+    bitrateLimit: safe.limit,
+    requestedBitrate
+  };
+}
+
+async function buildFFmpegArgsForPlaylist(stream, playlist, targets = null) {
   if (!playlist.videos || playlist.videos.length === 0) {
     throw new Error('Playlist is empty');
   }
 
   const projectRoot = path.resolve(__dirname, '..');
-  const rtmpUrl = `${stream.rtmp_url.replace(/\/$/, '')}/${stream.stream_key}`;
+  const resolvedTargets = resolveTargetsForArgs(stream, targets);
+  const encoding = resolveEncodingParams(stream, resolvedTargets);
+  const { keyframeSeconds, audioSampleRate } = encoding;
   const tempDir = path.join(projectRoot, 'temp');
 
   if (!fs.existsSync(tempDir)) {
@@ -449,16 +697,15 @@ async function buildFFmpegArgsForPlaylist(stream, playlist) {
         '-i', concatFile,
         '-c:v', 'copy',
         '-c:a', 'copy',
-        '-bsf:a', 'aac_adtstoasc',
-        '-f', 'flv',
-        '-flvflags', 'no_duration_filesize',
-        rtmpUrl
+        ...(resolvedTargets.length === 1 ? ['-bsf:a', 'aac_adtstoasc'] : []),
+        ...buildOutputArgs(resolvedTargets, {
+          isCopyMode: true,
+          mapArgs: ['-map', '0:v:0', '-map', '0:a:0?']
+        })
       ];
     }
 
-    const resolution = stream.resolution || '1280x720';
-    const bitrate = stream.bitrate || 2500;
-    const fps = stream.fps || 30;
+    const { resolution, bitrate, fps } = encoding;
 
     return [
       '-nostdin',
@@ -479,18 +726,19 @@ async function buildFFmpegArgsForPlaylist(stream, playlist) {
       '-maxrate', `${Math.round(bitrate * 1.1)}k`,
       '-bufsize', `${bitrate * 2}k`,
       '-pix_fmt', 'yuv420p',
-      '-g', String(fps * 2),
+      '-g', String(Math.max(1, Math.round(fps * keyframeSeconds))),
       '-keyint_min', String(fps),
       '-sc_threshold', '0',
       '-s', resolution,
       '-r', String(fps),
       '-c:a', 'aac',
       '-b:a', '128k',
-      '-ar', '44100',
+      '-ar', String(audioSampleRate),
       '-ac', '2',
-      '-f', 'flv',
-      '-flvflags', 'no_duration_filesize',
-      rtmpUrl
+      ...buildOutputArgs(resolvedTargets, {
+        isCopyMode: false,
+        mapArgs: ['-map', '0:v:0', '-map', '0:a:0?']
+      })
     ];
   }
 
@@ -534,15 +782,14 @@ async function buildFFmpegArgsForPlaylist(stream, playlist) {
       '-map', '1:a:0',
       '-c:v', 'copy',
       '-c:a', 'copy',
-      '-f', 'flv',
-      '-flvflags', 'no_duration_filesize',
-      rtmpUrl
+      ...buildOutputArgs(resolvedTargets, {
+        isCopyMode: true,
+        mapArgs: []
+      })
     ];
   }
 
-  const resolution = stream.resolution || '1280x720';
-  const bitrate = stream.bitrate || 2500;
-  const fps = stream.fps || 30;
+  const { resolution, bitrate, fps } = encoding;
 
   return [
     '-nostdin',
@@ -569,19 +816,20 @@ async function buildFFmpegArgsForPlaylist(stream, playlist) {
     '-maxrate', `${Math.round(bitrate * 1.1)}k`,
     '-bufsize', `${bitrate * 2}k`,
     '-pix_fmt', 'yuv420p',
-    '-g', String(fps * 2),
+    '-g', String(Math.max(1, Math.round(fps * keyframeSeconds))),
     '-keyint_min', String(fps),
     '-sc_threshold', '0',
     '-s', resolution,
     '-r', String(fps),
     '-c:a', 'copy',
-    '-f', 'flv',
-    '-flvflags', 'no_duration_filesize',
-    rtmpUrl
+    ...buildOutputArgs(resolvedTargets, {
+      isCopyMode: true,
+      mapArgs: []
+    })
   ];
 }
 
-async function buildFFmpegArgs(stream) {
+async function buildFFmpegArgs(stream, targets = null) {
   const streamWithVideo = await Stream.getStreamWithVideo(stream.id);
 
   if (streamWithVideo && streamWithVideo.video_type === 'playlist') {
@@ -589,7 +837,7 @@ async function buildFFmpegArgs(stream) {
     if (!playlist) {
       throw new Error('Playlist not found');
     }
-    return await buildFFmpegArgsForPlaylist(stream, playlist);
+    return await buildFFmpegArgsForPlaylist(stream, playlist, targets);
   }
 
   const video = await Video.findById(stream.video_id);
@@ -605,7 +853,9 @@ async function buildFFmpegArgs(stream) {
     throw new Error(`Video file not found: ${videoPath}`);
   }
 
-  const rtmpUrl = `${stream.rtmp_url.replace(/\/$/, '')}/${stream.stream_key}`;
+  const resolvedTargets = resolveTargetsForArgs(stream, targets);
+  const encoding = resolveEncodingParams(stream, resolvedTargets);
+  const { keyframeSeconds, audioSampleRate } = encoding;
   const loopValue = stream.loop_video ? '-1' : '0';
 
   if (!stream.use_advanced_settings) {
@@ -620,16 +870,15 @@ async function buildFFmpegArgs(stream) {
       '-i', videoPath,
       '-c:v', 'copy',
       '-c:a', 'copy',
-      '-bsf:a', 'aac_adtstoasc',
-      '-f', 'flv',
-      '-flvflags', 'no_duration_filesize',
-      rtmpUrl
+      ...(resolvedTargets.length === 1 ? ['-bsf:a', 'aac_adtstoasc'] : []),
+      ...buildOutputArgs(resolvedTargets, {
+        isCopyMode: true,
+        mapArgs: ['-map', '0:v:0', '-map', '0:a:0?']
+      })
     ];
   }
 
-  const resolution = stream.resolution || '1280x720';
-  const bitrate = stream.bitrate || 2500;
-  const fps = stream.fps || 30;
+  const { resolution, bitrate, fps } = encoding;
 
   return [
     '-nostdin',
@@ -649,18 +898,19 @@ async function buildFFmpegArgs(stream) {
     '-maxrate', `${Math.round(bitrate * 1.1)}k`,
     '-bufsize', `${bitrate * 2}k`,
     '-pix_fmt', 'yuv420p',
-    '-g', String(fps * 2),
+    '-g', String(Math.max(1, Math.round(fps * keyframeSeconds))),
     '-keyint_min', String(fps),
     '-sc_threshold', '0',
     '-s', resolution,
     '-r', String(fps),
     '-c:a', 'aac',
     '-b:a', '128k',
-    '-ar', '44100',
+    '-ar', String(audioSampleRate),
     '-ac', '2',
-    '-f', 'flv',
-    '-flvflags', 'no_duration_filesize',
-    rtmpUrl
+    ...buildOutputArgs(resolvedTargets, {
+      isCopyMode: false,
+      mapArgs: ['-map', '0:v:0', '-map', '0:a:0?']
+    })
   ];
 }
 
@@ -708,6 +958,150 @@ async function killFFmpegProcess(streamId, streamData) {
   });
 }
 
+/**
+ * Siapkan semua target yang memakai mode API (YouTube Data API / Facebook Graph API)
+ * sebelum FFmpeg dijalankan.
+ *
+ * Dijalankan berurutan (bukan paralel) supaya pesan error jelas dan tidak ada
+ * broadcast "nyangkut" saat salah satu platform gagal.
+ */
+async function prepareApiTargets(streamId, stream, targets, baseUrl) {
+  const effectiveBaseUrl = baseUrl || process.env.BASE_URL || 'http://localhost:7575';
+  let currentStream = stream;
+  const prepared = [];
+
+  for (const target of targets) {
+    const platform = resolveTargetPlatform(target);
+    const isApiMode = target.mode === 'api';
+
+    if (isApiMode && platform.key === 'youtube') {
+      addStreamLog(streamId, 'Creating YouTube broadcast...');
+
+      try {
+        const youtubeService = require('./youtubeService');
+        const ytResult = await youtubeService.createYouTubeBroadcast(streamId, effectiveBaseUrl);
+
+        if (!ytResult.success) {
+          addStreamLog(streamId, `YouTube broadcast failed: ${ytResult.error}`);
+          await StreamTarget.setStatus(target.id, 'error', ytResult.error || 'Failed to create YouTube broadcast');
+          return { success: false, error: ytResult.error || 'Failed to create YouTube broadcast' };
+        }
+
+        // youtubeService menulis kredensial ke kolom lama tabel streams,
+        // jadi kita baca ulang lalu salin ke baris target.
+        currentStream = await Stream.findById(streamId);
+
+        const patch = {
+          rtmp_url: currentStream.rtmp_url,
+          stream_key: currentStream.stream_key,
+          youtube_broadcast_id: currentStream.youtube_broadcast_id,
+          youtube_stream_id: currentStream.youtube_stream_id,
+          status: 'live',
+          last_error: null
+        };
+
+        await StreamTarget.update(target.id, patch);
+        prepared.push({ ...target, ...patch });
+        addStreamLog(streamId, `YouTube broadcast created: ${ytResult.broadcastId}`);
+      } catch (ytError) {
+        addStreamLog(streamId, `YouTube API error: ${ytError.message}`);
+        await StreamTarget.setStatus(target.id, 'error', ytError.message);
+        return { success: false, error: `YouTube API error: ${ytError.message}` };
+      }
+
+      continue;
+    }
+
+    if (isApiMode && platform.key === 'facebook') {
+      addStreamLog(streamId, 'Creating Facebook live video...');
+
+      try {
+        const facebookService = require('./facebookService');
+        const live = await facebookService.prepareTargetForStream(currentStream, target);
+
+        currentStream = await Stream.findById(streamId);
+
+        const patch = {
+          rtmp_url: live.rtmpUrl,
+          stream_key: live.streamKey,
+          facebook_live_video_id: live.liveVideoId,
+          facebook_permalink: live.permalink || null,
+          status: 'live',
+          last_error: null
+        };
+
+        prepared.push({ ...target, ...patch });
+        addStreamLog(streamId, `Facebook live video created: ${live.liveVideoId}`);
+      } catch (fbError) {
+        addStreamLog(streamId, `Facebook API error: ${fbError.message}`);
+        await StreamTarget.setStatus(target.id, 'error', fbError.message);
+        return { success: false, error: fbError.message };
+      }
+
+      continue;
+    }
+
+    // Mode manual: RTMP URL + stream key sudah diisi user.
+    prepared.push(target);
+  }
+
+  // Sinkronkan kolom lama streams.rtmp_url / stream_key dengan target pertama
+  // supaya UI lama, riwayat, dan fitur "check key" tetap berjalan.
+  const primary = prepared[0];
+
+  if (primary && primary.rtmp_url && primary.stream_key
+    && (currentStream.rtmp_url !== primary.rtmp_url || currentStream.stream_key !== primary.stream_key)) {
+    await Stream.update(streamId, {
+      rtmp_url: primary.rtmp_url,
+      stream_key: primary.stream_key
+    });
+    currentStream = await Stream.findById(streamId);
+  }
+
+  return { success: true, stream: currentStream, targets: prepared };
+}
+
+/**
+ * Akhiri semua sesi API saat stream dihentikan (Facebook live video, dsb).
+ * Selalu "best effort": kegagalan di sini tidak boleh menggagalkan stop.
+ */
+async function finalizeApiTargets(stream) {
+  let targets = [];
+
+  try {
+    targets = await StreamTarget.findByStream(stream.id);
+  } catch (e) {
+    return;
+  }
+
+  for (const target of targets) {
+    const platform = resolveTargetPlatform(target);
+
+    if (target.mode === 'api' && platform.key === 'facebook' && target.facebook_live_video_id) {
+      try {
+        const facebookService = require('./facebookService');
+        await facebookService.finalizeTarget(stream, target);
+        addStreamLog(stream.id, 'Facebook live video ended');
+      } catch (e) {
+        addStreamLog(stream.id, `Failed to end Facebook live video: ${e.message}`);
+      }
+    }
+
+    try {
+      await StreamTarget.setStatus(target.id, 'ended');
+    } catch (e) { }
+  }
+}
+
+/**
+ * Ringkasan platform untuk log & riwayat, mis. "YouTube + Facebook".
+ */
+function describeTargets(targets) {
+  return (targets || [])
+    .map((target) => resolveTargetPlatform(target).label)
+    .join(' + ');
+}
+
 async function startStream(streamId, isRetry = false, baseUrl = null) {
   if (startingStreams.has(streamId)) {
     return { success: false, error: 'Stream start is already in progress' };
@@ -742,33 +1136,51 @@ async function startStream(streamId, isRetry = false, baseUrl = null) {
     const originalStartTime = stream.start_time;
     const originalEndTime = stream.end_time;
 
-    await validateCopyModeCompatibility(stream);
+    // Pastikan stream punya daftar tujuan. Untuk stream versi lama, baris
+    // stream_targets dibuat otomatis dari kolom lama (tanpa mengubah perilaku).
+    let targets = [];
 
-    if (stream.is_youtube_api) {
-      const youtubeService = require('./youtubeService');
-      const effectiveBaseUrl = baseUrl || process.env.BASE_URL || 'http://localhost:7575';
-
-      addStreamLog(streamId, 'Creating YouTube broadcast...');
-
-      try {
-        const ytResult = await youtubeService.createYouTubeBroadcast(streamId, effectiveBaseUrl);
-        if (!ytResult.success) {
-          addStreamLog(streamId, `YouTube broadcast failed: ${ytResult.error}`);
-          return { success: false, error: ytResult.error || 'Failed to create YouTube broadcast' };
-        }
-        stream = await Stream.findById(streamId);
-        addStreamLog(streamId, `YouTube broadcast created: ${ytResult.broadcastId}`);
-      } catch (ytError) {
-        addStreamLog(streamId, `YouTube API error: ${ytError.message}`);
-        return { success: false, error: `YouTube API error: ${ytError.message}` };
-      }
+    try {
+      await StreamTarget.ensureForStream(stream);
+      targets = await StreamTarget.findByStream(streamId, { enabledOnly: true });
+    } catch (targetError) {
+      addStreamLog(streamId, `Failed to load stream targets: ${targetError.message}`);
+      return { success: false, error: `Failed to load stream targets: ${targetError.message}` };
     }
 
-    if (!stream.rtmp_url || !stream.stream_key) {
-      return { success: false, error: 'Missing RTMP URL or stream key' };
+    if (!targets || targets.length === 0) {
+      return { success: false, error: 'Tidak ada platform tujuan yang aktif untuk stream ini' };
     }
 
-    const ffmpegArgs = await buildFFmpegArgs(stream);
+    await validateCopyModeCompatibility(stream, targets);
+
+    const preparation = await prepareApiTargets(streamId, stream, targets, baseUrl);
+
+    if (!preparation.success) {
+      return { success: false, error: preparation.error };
+    }
+
+    stream = preparation.stream;
+    targets = preparation.targets;
+
+    const incompleteTarget = targets.find((target) => !target.rtmp_url || !target.stream_key);
+
+    if (incompleteTarget) {
+      const label = resolveTargetPlatform(incompleteTarget).label;
+      return { success: false, error: `Missing RTMP URL or stream key (${label})` };
+    }
+
+    if (targets.length > 1) {
+      addStreamLog(streamId, `Simulcast aktif ke ${targets.length} platform: ${describeTargets(targets)}`);
+    }
+
+    const safeBitrate = resolveSafeBitrate(stream.bitrate || 2500, targets);
+
+    if (safeBitrate.capped) {
+      addStreamLog(streamId, `Bitrate dibatasi otomatis ke ${safeBitrate.bitrate} kbps (batas ${describeTargets(targets)}: ${safeBitrate.limit} kbps)`);
+    }
+
+    const ffmpegArgs = await buildFFmpegArgs(stream, targets);
 
     addStreamLog(streamId, `Starting FFmpeg process`);
 
@@ -1021,6 +1433,8 @@ async function stopStream(streamId) {
         } catch (e) { }
       }
 
+      await finalizeApiTargets(stream);
+
       await saveStreamHistory(stream);
       await Stream.updateStatus(streamId, 'offline', stream.user_id);
     }
@@ -1221,6 +1635,23 @@ async function saveStreamHistory(stream) {
 
     const videoDetails = stream.video_id ? await Video.findById(stream.video_id) : null;
 
+    // Kolom `platforms` menyimpan semua tujuan (mis. "Youtube + Facebook").
+    // Kolom lama `platform` tetap diisi agar tampilan riwayat versi lama aman.
+    let platformsLabel = stream.platform || 'Custom';
+
+    try {
+      const historyTargets = await StreamTarget.findByStream(stream.id);
+
+      if (historyTargets && historyTargets.length > 0) {
+        platformsLabel = historyTargets
+          .map((target) => String(target.platform || 'custom'))
+          .map((name) => name.charAt(0).toUpperCase() + name.slice(1))
+          .join(' + ');
+      }
+    } catch (targetError) {
+      // Abaikan: fallback ke stream.platform di atas.
+    }
+
     const historyData = {
       id: uuidv4(),
       stream_id: stream.id,
@@ -1236,21 +1667,24 @@ async function saveStreamHistory(stream) {
       end_time: endTime.toISOString(),
       duration: durationSeconds,
       use_advanced_settings: stream.use_advanced_settings ? 1 : 0,
-      user_id: stream.user_id
+      user_id: stream.user_id,
+      platforms: platformsLabel
     };
 
     return new Promise((resolve, reject) => {
       db.run(
         `INSERT INTO stream_history (
           id, stream_id, title, platform, platform_icon, video_id, video_title,
-          resolution, bitrate, fps, start_time, end_time, duration, use_advanced_settings, user_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          resolution, bitrate, fps, start_time, end_time, duration, use_advanced_settings, user_id,
+          platforms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           historyData.id, historyData.stream_id, historyData.title,
           historyData.platform, historyData.platform_icon, historyData.video_id, historyData.video_title,
           historyData.resolution, historyData.bitrate, historyData.fps,
           historyData.start_time, historyData.end_time, historyData.duration,
-          historyData.use_advanced_settings, historyData.user_id
+          historyData.use_advanced_settings, historyData.user_id,
+          historyData.platforms
         ],
         function (err) {
           if (err) {
@@ -1309,6 +1743,13 @@ module.exports = {
   startStream,
   stopStream,
   validateCopyModeCompatibilityForInput,
+  buildFFmpegArgs,
+  buildOutputArgs,
+  buildTargetUrls,
+  resolveEncodingParams,
+  getCopyConstraintsForTargets,
+  escapeTeeUrl,
+  finalizeApiTargets,
   isStreamActive,
   isStreamStarting,
   getActiveStreams,

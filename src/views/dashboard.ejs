@@ -212,16 +212,34 @@
             <input type="hidden" id="selectedVideoId" name="videoId" value="">
             <input type="hidden" id="streamMode" name="streamMode" value="manual">
             
-            <% if (typeof youtubeConnected !== 'undefined' && youtubeConnected) { %>
-            <div class="flex gap-2 p-1 bg-dark-900 rounded-lg">
-              <button type="button" id="manualModeBtn" onclick="setStreamMode('manual')" class="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg transition-colors bg-primary text-white">
+            <%
+              var ytReady = (typeof youtubeConnected !== 'undefined' && youtubeConnected);
+              var fbReady = (typeof facebookConnected !== 'undefined' && facebookConnected);
+            %>
+            <% if (ytReady || fbReady) { %>
+            <div class="flex flex-wrap gap-2 p-1 bg-dark-900 rounded-lg">
+              <button type="button" id="manualModeBtn" onclick="setStreamMode('manual')" class="flex-1 min-w-[140px] flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg transition-colors bg-primary text-white">
                 <i class="ti ti-settings"></i>
                 <span class="text-sm font-medium">Manual (RTMP)</span>
               </button>
-              <button type="button" id="autoModeBtn" onclick="setStreamMode('auto')" class="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg transition-colors text-gray-400 hover:text-white hover:bg-dark-700">
+              <% if (ytReady) { %>
+              <button type="button" id="autoModeBtn" onclick="setStreamMode('auto')" class="flex-1 min-w-[140px] flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg transition-colors text-gray-400 hover:text-white hover:bg-dark-700">
                 <i class="ti ti-brand-youtube"></i>
                 <span class="text-sm font-medium">YouTube API</span>
               </button>
+              <% } %>
+              <% if (fbReady) { %>
+              <button type="button" id="facebookModeBtn" onclick="setStreamMode('facebook')" class="flex-1 min-w-[140px] flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg transition-colors text-gray-400 hover:text-white hover:bg-dark-700">
+                <i class="ti ti-brand-facebook"></i>
+                <span class="text-sm font-medium">Facebook API</span>
+              </button>
+              <% } %>
+              <% if (ytReady && fbReady) { %>
+              <button type="button" id="multiModeBtn" onclick="setStreamMode('multi')" class="flex-1 min-w-[140px] flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg transition-colors text-gray-400 hover:text-white hover:bg-dark-700">
+                <i class="ti ti-broadcast"></i>
+                <span class="text-sm font-medium">Both (Simulcast)</span>
+              </button>
+              <% } %>
             </div>
             <% } %>
 
@@ -505,6 +523,50 @@
                     </div>
                   </div>
                   <input type="hidden" id="ytSelectedVideoId" name="ytVideoId" value="">
+
+                  <!-- ===== Destinations: Facebook Page & simulcast selection ===== -->
+                  <div id="destinationsBlock" class="hidden space-y-4 p-4 bg-dark-900 rounded-lg border border-gray-700">
+                    <div id="multiDestinationsBlock" class="hidden space-y-2">
+                      <label class="text-sm font-medium text-white block">Stream Destinations</label>
+                      <p class="text-xs text-gray-500">Video di-encode sekali lalu dikirim ke semua platform terpilih.</p>
+                      <label class="flex items-center gap-2 text-sm text-gray-300">
+                        <input type="checkbox" id="destYoutube" checked class="rounded border-gray-600 bg-dark-700">
+                        <i class="ti ti-brand-youtube text-red-500"></i>
+                        <span>YouTube</span>
+                      </label>
+                      <label class="flex items-center gap-2 text-sm text-gray-300">
+                        <input type="checkbox" id="destFacebook" checked class="rounded border-gray-600 bg-dark-700">
+                        <i class="ti ti-brand-facebook text-blue-500"></i>
+                        <span>Facebook</span>
+                      </label>
+                    </div>
+
+                    <div id="facebookTargetBlock" class="hidden space-y-3">
+                      <div>
+                        <label class="text-sm font-medium text-white block mb-2">
+                          <i class="ti ti-brand-facebook text-blue-500 mr-1"></i>Facebook Page
+                        </label>
+                        <select id="fbTargetId" class="w-full px-4 py-2.5 bg-dark-700 border border-gray-600 rounded-lg focus:border-primary focus:ring-1 focus:ring-primary">
+                          <% if (typeof facebookPages !== 'undefined' && facebookPages.length > 0) { %>
+                            <% facebookPages.forEach(function(page) { %>
+                              <option value="<%= page.id %>" <%= page.is_default ? 'selected' : '' %>><%= page.target_name %></option>
+                            <% }); %>
+                          <% } %>
+                        </select>
+                      </div>
+                      <div>
+                        <label class="text-sm font-medium text-white block mb-2">Facebook Privacy</label>
+                        <select id="fbPrivacy" class="w-full px-4 py-2.5 bg-dark-700 border border-gray-600 rounded-lg focus:border-primary focus:ring-1 focus:ring-primary">
+                          <option value="EVERYONE" selected>Public (Everyone)</option>
+                          <option value="FRIENDS">Friends</option>
+                          <option value="SELF">Only me (test)</option>
+                        </select>
+                      </div>
+                      <p class="text-xs text-gray-500">
+                        <i class="ti ti-info-circle mr-1"></i>Bitrate dibatasi otomatis maksimal 4000 kbps agar stabil di Facebook.
+                      </p>
+                    </div>
+                  </div>
 
                   <div>
                     <label class="text-sm font-medium text-white block mb-2">Stream Title</label>
@@ -1615,6 +1677,11 @@
       e.preventDefault();
       const csrfToken = document.querySelector('input[name="_csrf"]')?.value;
       
+      if (currentStreamMode === 'facebook' || currentStreamMode === 'multi') {
+        createApiStream(currentStreamMode, csrfToken);
+        return;
+      }
+
       if (currentStreamMode === 'auto') {
         const ytVideoId = document.getElementById('ytSelectedVideoId').value;
         if (!ytVideoId) {
@@ -2506,40 +2573,198 @@
       const streamModeInput = document.getElementById('streamMode');
       if (streamModeInput) streamModeInput.value = mode;
       
-      const manualBtn = document.getElementById('manualModeBtn');
-      const autoBtn = document.getElementById('autoModeBtn');
       const manualForm = document.getElementById('manualStreamForm');
       const youtubeForm = document.getElementById('youtubeStreamForm');
-      
-      if (!manualBtn || !autoBtn || !manualForm || !youtubeForm) {
+
+      if (!manualForm || !youtubeForm) {
         return;
       }
-      
+
+      // Tombol mode bersifat opsional: hanya dirender jika platformnya terhubung.
+      const modeButtons = {
+        manual: document.getElementById('manualModeBtn'),
+        auto: document.getElementById('autoModeBtn'),
+        facebook: document.getElementById('facebookModeBtn'),
+        multi: document.getElementById('multiModeBtn')
+      };
+
+      const activeClasses = {
+        manual: 'bg-primary text-white',
+        auto: 'bg-red-600 text-white',
+        facebook: 'bg-blue-600 text-white',
+        multi: 'bg-purple-600 text-white'
+      };
+
+      const BASE_CLASS = 'flex-1 min-w-[140px] flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg transition-colors ';
+      const INACTIVE_CLASS = 'text-gray-400 hover:text-white hover:bg-dark-700';
+
+      Object.keys(modeButtons).forEach(function (key) {
+        const button = modeButtons[key];
+        if (!button) return;
+        button.className = BASE_CLASS + (key === mode ? activeClasses[key] : INACTIVE_CLASS);
+      });
+
       const manualStreamTitle = document.getElementById('streamTitle');
       const manualRtmpUrl = document.getElementById('rtmpUrl');
       const manualStreamKey = document.getElementById('streamKey');
-      
-      if (mode === 'manual') {
-        manualBtn.className = 'flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg transition-colors bg-primary text-white';
-        autoBtn.className = 'flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg transition-colors text-gray-400 hover:text-white hover:bg-dark-700';
-        manualForm.classList.remove('hidden');
-        youtubeForm.classList.add('hidden');
-        
-        if (manualStreamTitle) manualStreamTitle.required = true;
-        if (manualRtmpUrl) manualRtmpUrl.required = true;
-        if (manualStreamKey) manualStreamKey.required = true;
-      } else {
-        autoBtn.className = 'flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg transition-colors bg-red-600 text-white';
-        manualBtn.className = 'flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg transition-colors text-gray-400 hover:text-white hover:bg-dark-700';
-        manualForm.classList.add('hidden');
-        youtubeForm.classList.remove('hidden');
-        
-        if (manualStreamTitle) manualStreamTitle.required = false;
-        if (manualRtmpUrl) manualRtmpUrl.required = false;
-        if (manualStreamKey) manualStreamKey.required = false;
-        
+      const isManual = mode === 'manual';
+
+      manualForm.classList.toggle('hidden', !isManual);
+      youtubeForm.classList.toggle('hidden', isManual);
+
+      if (manualStreamTitle) manualStreamTitle.required = isManual;
+      if (manualRtmpUrl) manualRtmpUrl.required = isManual;
+      if (manualStreamKey) manualStreamKey.required = isManual;
+
+      // Blok tujuan: Facebook Page (mode facebook & multi) + checkbox simulcast.
+      const destinationsBlock = document.getElementById('destinationsBlock');
+      const multiDestinationsBlock = document.getElementById('multiDestinationsBlock');
+      const facebookTargetBlock = document.getElementById('facebookTargetBlock');
+      const needsFacebook = mode === 'facebook' || mode === 'multi';
+
+      if (destinationsBlock) destinationsBlock.classList.toggle('hidden', !needsFacebook);
+      if (multiDestinationsBlock) multiDestinationsBlock.classList.toggle('hidden', mode !== 'multi');
+      if (facebookTargetBlock) facebookTargetBlock.classList.toggle('hidden', !needsFacebook);
+
+      // Field khusus YouTube tidak relevan saat mode Facebook saja.
+      const youtubeOnlyIds = ['ytPrivacy', 'ytCategory', 'ytTags'];
+      youtubeOnlyIds.forEach(function (id) {
+        const field = document.getElementById(id);
+        if (!field) return;
+        const wrapper = field.closest('div');
+        if (wrapper) wrapper.classList.toggle('hidden', mode === 'facebook');
+      });
+
+      if (!isManual) {
         loadYoutubeVideos();
       }
+    }
+
+    /**
+     * Buat stream lewat Graph/Data API untuk mode 'facebook' (satu platform)
+     * dan 'multi' (YouTube + Facebook sekaligus).
+     */
+    function createApiStream(mode, csrfToken) {
+      const videoId = document.getElementById('ytSelectedVideoId').value;
+
+      if (!videoId) {
+        showToast('error', 'Please select a video before creating the stream');
+        return;
+      }
+
+      const title = document.getElementById('ytStreamTitle').value.trim();
+
+      if (!title) {
+        showToast('error', 'Please enter a stream title');
+        return;
+      }
+
+      const description = document.getElementById('ytDescription').value;
+      const fbTargetSelect = document.getElementById('fbTargetId');
+      const fbPrivacySelect = document.getElementById('fbPrivacy');
+      const scheduleEnabled = document.getElementById('ytEnableSchedule')?.checked;
+      const scheduleStart = scheduleEnabled ? document.getElementById('ytScheduleStart').value : '';
+      const scheduleEnd = scheduleEnabled ? document.getElementById('ytScheduleEnd').value : '';
+
+      let endpoint;
+      let payload;
+
+      if (mode === 'facebook') {
+        endpoint = '/api/streams/facebook';
+        payload = {
+          videoId: videoId,
+          title: title,
+          description: description,
+          privacy: fbPrivacySelect ? fbPrivacySelect.value : 'EVERYONE',
+          fbTargetId: fbTargetSelect ? fbTargetSelect.value : '',
+          loopVideo: true
+        };
+      } else {
+        const wantYoutube = document.getElementById('destYoutube')?.checked;
+        const wantFacebook = document.getElementById('destFacebook')?.checked;
+
+        if (!wantYoutube && !wantFacebook) {
+          showToast('error', 'Pilih minimal satu platform tujuan');
+          return;
+        }
+
+        const targets = [];
+
+        if (wantYoutube) {
+          targets.push({
+            platform: 'youtube',
+            mode: 'api',
+            channelId: document.getElementById('ytSelectedChannelId')?.value || '',
+            privacy: document.getElementById('ytPrivacy')?.value || 'unlisted',
+            category: document.getElementById('ytCategory')?.value || '22',
+            tags: document.getElementById('ytTags')?.value || '',
+            monetization: document.getElementById('ytEnableMonetization')?.checked || false
+          });
+        }
+
+        if (wantFacebook) {
+          targets.push({
+            platform: 'facebook',
+            mode: 'api',
+            targetId: fbTargetSelect ? fbTargetSelect.value : '',
+            privacy: fbPrivacySelect ? fbPrivacySelect.value : 'EVERYONE'
+          });
+        }
+
+        endpoint = '/api/streams/multi';
+        payload = {
+          videoId: videoId,
+          title: title,
+          description: description,
+          privacy: document.getElementById('ytPrivacy')?.value || 'unlisted',
+          loopVideo: true,
+          targets: targets
+        };
+      }
+
+      if (scheduleStart) payload.scheduleStartTime = scheduleStart;
+      if (scheduleEnd) payload.scheduleEndTime = scheduleEnd;
+
+      const createBtn = document.querySelector('#newStreamModal button[type="submit"]');
+      const originalBtnText = createBtn ? createBtn.innerHTML : '';
+
+      if (createBtn) {
+        createBtn.innerHTML = '<i class="ti ti-loader animate-spin font-loaded"></i> Creating...';
+        createBtn.disabled = true;
+        createBtn.classList.add('opacity-70', 'cursor-not-allowed');
+      }
+
+      function resetCreateBtn() {
+        if (!createBtn) return;
+        createBtn.innerHTML = originalBtnText;
+        createBtn.disabled = false;
+        createBtn.classList.remove('opacity-70', 'cursor-not-allowed');
+      }
+
+      fetch(endpoint, {
+        method: 'POST',
+        headers: Object.assign(
+          { 'Content-Type': 'application/json' },
+          csrfToken ? { 'X-CSRF-Token': csrfToken } : {}
+        ),
+        body: JSON.stringify(payload)
+      })
+        .then(function (response) { return response.json(); })
+        .then(function (data) {
+          if (data.success) {
+            showToast('success', data.message || 'Stream created successfully!');
+            closeNewStreamModal();
+            refreshStreamsView(1, '');
+          } else {
+            showToast('error', data.error || 'Failed to create stream');
+            resetCreateBtn();
+          }
+        })
+        .catch(function (error) {
+          console.error('Error:', error);
+          showToast('error', 'An error occurred while creating the stream');
+          resetCreateBtn();
+        });
     }
 
     function toggleYoutubeVideoSelector() {

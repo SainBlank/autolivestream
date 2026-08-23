@@ -376,6 +376,141 @@ function createTables() {
         }
       });
 
+      // =====================================================================
+      // MULTI-PLATFORM STREAMING (YouTube + Facebook) - migrasi ADITIF
+      // ---------------------------------------------------------------------
+      // Semua statement di bawah ini aman dijalankan berulang kali:
+      //   - CREATE TABLE IF NOT EXISTS
+      //   - ALTER TABLE ADD COLUMN (error "duplicate column name" diabaikan)
+      // Tidak ada DROP/RENAME, sehingga database lama tetap kompatibel.
+      // =====================================================================
+
+      // Akun/Page Facebook milik user (analog tabel youtube_channels).
+      db.run(`CREATE TABLE IF NOT EXISTS facebook_targets (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        target_type TEXT DEFAULT 'page',
+        target_id TEXT NOT NULL,
+        target_name TEXT,
+        target_thumbnail TEXT,
+        follower_count TEXT DEFAULT '0',
+        access_token TEXT,
+        token_expires_at TIMESTAMP,
+        is_default INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      )`, (err) => {
+        if (err && !err.message.includes('already exists')) {
+          console.error('Error creating facebook_targets table:', err.message);
+        }
+      });
+
+      // Satu stream bisa punya BANYAK tujuan (YouTube, Facebook, custom RTMP).
+      db.run(`CREATE TABLE IF NOT EXISTS stream_targets (
+        id TEXT PRIMARY KEY,
+        stream_id TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        platform_icon TEXT,
+        mode TEXT DEFAULT 'manual',
+        rtmp_url TEXT,
+        stream_key TEXT,
+        is_enabled INTEGER DEFAULT 1,
+        status TEXT DEFAULT 'idle',
+        last_error TEXT,
+        order_index INTEGER DEFAULT 0,
+        youtube_channel_id TEXT,
+        facebook_target_id TEXT,
+        youtube_broadcast_id TEXT,
+        youtube_stream_id TEXT,
+        facebook_live_video_id TEXT,
+        facebook_permalink TEXT,
+        title TEXT,
+        description TEXT,
+        privacy TEXT,
+        tags TEXT,
+        category TEXT,
+        thumbnail_path TEXT,
+        monetization INTEGER DEFAULT 0,
+        started_at TIMESTAMP,
+        ended_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (stream_id) REFERENCES streams(id) ON DELETE CASCADE
+      )`, (err) => {
+        if (err && !err.message.includes('already exists')) {
+          console.error('Error creating stream_targets table:', err.message);
+        }
+      });
+
+      db.run('CREATE INDEX IF NOT EXISTS idx_stream_targets_stream ON stream_targets(stream_id)', () => {});
+      db.run('CREATE INDEX IF NOT EXISTS idx_facebook_targets_user ON facebook_targets(user_id)', () => {});
+
+      const addColumn = (table, definition) => {
+        db.run(`ALTER TABLE ${table} ADD COLUMN ${definition}`, (err) => {
+          if (err && !err.message.includes('duplicate column name')) {
+            console.error(`Error adding column to ${table} (${definition}):`, err.message);
+          }
+        });
+      };
+
+      // Kolom multi-platform pada tabel streams. Default menjaga perilaku lama.
+      addColumn('streams', "stream_mode TEXT DEFAULT 'single'");
+      addColumn('streams', 'is_multi_platform INTEGER DEFAULT 0');
+      addColumn('streams', 'is_facebook_api INTEGER DEFAULT 0');
+      addColumn('streams', 'facebook_target_id TEXT');
+      addColumn('streams', 'facebook_live_video_id TEXT');
+      addColumn('streams', 'facebook_description TEXT');
+      addColumn('streams', 'facebook_privacy TEXT');
+      addColumn('streams', 'facebook_permalink TEXT');
+      addColumn('streams', 'facebook_stream_url TEXT');
+
+      // Kredensial Facebook App milik user (secret disimpan terenkripsi).
+      addColumn('users', 'facebook_app_id TEXT');
+      addColumn('users', 'facebook_app_secret TEXT');
+      addColumn('users', 'facebook_redirect_uri TEXT');
+      addColumn('users', 'facebook_user_token TEXT');
+      addColumn('users', 'facebook_token_expires_at TIMESTAMP');
+
+      // Riwayat: simpan daftar platform (mis. "YouTube,Facebook").
+      addColumn('stream_history', 'platforms TEXT');
+
+      // Backfill: stream lama otomatis mendapat satu baris stream_targets
+      // sehingga model baru langsung kompatibel dengan data yang sudah ada.
+      db.run(`INSERT INTO stream_targets (
+        id, stream_id, platform, platform_icon, mode, rtmp_url, stream_key,
+        is_enabled, status, order_index, youtube_channel_id,
+        youtube_broadcast_id, youtube_stream_id,
+        title, description, privacy, tags, category, thumbnail_path, monetization
+      )
+      SELECT
+        lower(hex(randomblob(16))),
+        s.id,
+        CASE WHEN s.is_youtube_api = 1 THEN 'youtube' ELSE lower(COALESCE(NULLIF(s.platform, ''), 'custom')) END,
+        s.platform_icon,
+        CASE WHEN s.is_youtube_api = 1 THEN 'api' ELSE 'manual' END,
+        s.rtmp_url,
+        s.stream_key,
+        1,
+        CASE WHEN s.status = 'live' THEN 'live' ELSE 'idle' END,
+        0,
+        s.youtube_channel_id,
+        s.youtube_broadcast_id,
+        s.youtube_stream_id,
+        s.title,
+        s.youtube_description,
+        s.youtube_privacy,
+        s.youtube_tags,
+        s.youtube_category,
+        s.youtube_thumbnail,
+        COALESCE(s.youtube_monetization, 0)
+      FROM streams s
+      WHERE NOT EXISTS (SELECT 1 FROM stream_targets t WHERE t.stream_id = s.id)`, (err) => {
+        if (err) {
+          console.error('Error backfilling stream_targets:', err.message);
+        }
+      });
+
       db.run(`CREATE TABLE IF NOT EXISTS app_settings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         setting_key TEXT UNIQUE NOT NULL,

@@ -435,6 +435,352 @@
           </div>
         </div>
       </div>
+
+      <!-- ================= FACEBOOK LIVE INTEGRATION ================= -->
+      <div class="bg-gray-800 rounded-lg p-6 mt-8">
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 lg:divide-x lg:divide-gray-700">
+          <div class="lg:pr-8">
+            <h3 class="text-lg font-semibold mb-6">
+              <i class="ti ti-brand-facebook text-blue-500 mr-1"></i>Facebook Integration
+            </h3>
+
+            <div class="mb-6">
+              <label class="block text-sm font-medium text-gray-300 mb-2">
+                <i class="ti ti-link mr-1"></i>Valid OAuth Redirect URI
+              </label>
+              <p class="text-xs text-gray-500 mb-2">Copy this URL into Facebook App &rarr; Facebook Login &rarr; Settings</p>
+              <div class="flex items-center gap-2">
+                <div class="relative flex-1">
+                  <input type="text" id="fb-redirect-uri" readonly
+                    class="bg-dark-900 text-gray-400 pl-4 pr-12 py-2 rounded-lg block w-full focus:outline-none border border-gray-700 cursor-not-allowed font-mono text-sm"
+                    value="">
+                  <button type="button" id="fb-copy-redirect-uri"
+                    class="absolute inset-y-0 right-0 flex items-center pr-3 text-gray-400 hover:text-primary transition-colors"
+                    title="Copy to clipboard">
+                    <i class="ti ti-copy"></i>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <form id="facebook-credentials-form" class="space-y-6">
+              <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+              <input type="hidden" name="activeTab" value="integration">
+
+              <div class="space-y-4">
+                <div class="space-y-2">
+                  <label for="facebook-app-id" class="block text-sm font-medium text-gray-300">
+                    <i class="ti ti-key mr-1"></i>App ID
+                  </label>
+                  <div class="relative">
+                    <input type="text" id="facebook-app-id" name="facebookAppId"
+                      class="bg-dark-900 text-white px-4 py-2 rounded-lg block w-full focus:outline-none focus:ring-1 focus:ring-primary border border-gray-700"
+                      placeholder="Enter your Facebook App ID"
+                      value="<%= typeof facebookAppId !== 'undefined' ? facebookAppId : '' %>">
+                  </div>
+                </div>
+
+                <div class="space-y-2">
+                  <label for="facebook-app-secret" class="block text-sm font-medium text-gray-300">
+                    <i class="ti ti-lock mr-1"></i>App Secret
+                  </label>
+                  <div class="relative">
+                    <input type="password" id="facebook-app-secret" name="facebookAppSecret"
+                      class="bg-dark-900 text-white px-4 py-2 rounded-lg block w-full focus:outline-none focus:ring-1 focus:ring-primary border border-gray-700"
+                      placeholder="Enter your Facebook App Secret"
+                      value="<%= typeof facebookAppSecret !== 'undefined' ? facebookAppSecret : '' %>">
+                  </div>
+                  <% if (typeof hasFacebookCredentials !== 'undefined' && hasFacebookCredentials) { %>
+                  <p class="text-xs text-gray-500">Enter a new value to update</p>
+                  <% } %>
+                </div>
+              </div>
+
+              <div class="pt-2">
+                <button type="submit" id="save-facebook-credentials"
+                  class="px-4 py-2 bg-primary hover:bg-blue-600 text-white rounded-lg transition-colors">
+                  <i class="ti ti-device-floppy mr-2"></i>Save App Credentials
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <div class="lg:pl-8">
+            <div class="space-y-4">
+              <div class="flex items-center justify-between">
+                <div>
+                  <h4 class="text-lg font-semibold mb-1">Connected Pages</h4>
+                  <p class="text-gray-400 text-sm">Manage your Facebook Pages for streaming</p>
+                </div>
+                <button type="button" id="connect-facebook"
+                  class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors text-sm disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                  <%= (typeof hasFacebookCredentials === 'undefined' || !hasFacebookCredentials) ? 'disabled' : '' %>>
+                  <i class="ti ti-plus"></i>
+                  <span>Add Page</span>
+                </button>
+              </div>
+
+              <div id="facebook-pages-list" class="space-y-3">
+                <% if (typeof facebookPages !== 'undefined' && facebookPages.length > 0) { %>
+                  <% facebookPages.forEach(function(page) { %>
+                    <div class="bg-dark-900 rounded-lg p-4 border border-gray-700 fb-page-item" data-page-id="<%= page.id %>">
+                      <div class="flex items-center justify-between flex-wrap gap-4">
+                        <div class="flex items-center gap-3">
+                          <div class="w-12 h-12 rounded-full overflow-hidden bg-gray-700 flex-shrink-0">
+                            <% if (page.target_thumbnail) { %>
+                              <img src="<%= page.target_thumbnail %>" alt="Page" class="w-full h-full object-cover">
+                            <% } else { %>
+                              <div class="w-full h-full flex items-center justify-center bg-blue-600">
+                                <i class="ti ti-brand-facebook text-white text-xl"></i>
+                              </div>
+                            <% } %>
+                          </div>
+                          <div>
+                            <div class="flex items-center gap-2">
+                              <p class="font-medium text-white"><%= page.target_name %></p>
+                              <% if (page.is_default) { %>
+                                <span class="px-2 py-0.5 bg-blue-600/20 text-blue-600 text-xs rounded-sm">Default</span>
+                              <% } %>
+                            </div>
+                            <p class="text-xs text-gray-400"><%= Number(page.follower_count || 0).toLocaleString() %> followers</p>
+                          </div>
+                        </div>
+                        <div class="flex items-center gap-2">
+                          <% if (!page.is_default) { %>
+                            <button type="button" onclick="setDefaultFacebookPage('<%= page.id %>')"
+                              class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors text-sm" title="Set as default">
+                              <i class="ti ti-star"></i>
+                            </button>
+                          <% } %>
+                          <button type="button" onclick="disconnectFacebookPage('<%= page.id %>', '<%= page.target_name %>')"
+                            class="px-3 py-1.5 bg-gray-600 hover:bg-red-600 text-white rounded-lg transition-colors text-sm" title="Disconnect">
+                            <i class="ti ti-unlink"></i>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  <% }); %>
+                <% } else { %>
+                  <div id="no-fb-pages-message" class="bg-dark-900 rounded-lg p-6 border border-gray-700 text-center">
+                    <div class="w-16 h-16 rounded-full bg-gray-700 flex items-center justify-center mx-auto mb-4">
+                      <i class="ti ti-brand-facebook text-gray-400 text-3xl"></i>
+                    </div>
+                    <p class="font-medium text-gray-300 mb-2">No Facebook Pages connected</p>
+                    <p class="text-sm text-gray-500">Click "Add Page" to connect your first Facebook Page</p>
+                  </div>
+                <% } %>
+              </div>
+
+              <% if (typeof facebookPages !== 'undefined' && facebookPages.length > 1) { %>
+              <div class="pt-2">
+                <button type="button" id="disconnect-all-facebook"
+                  class="px-4 py-2 bg-gray-700 hover:bg-red-600 text-white rounded-lg transition-colors text-sm">
+                  <i class="ti ti-trash mr-1"></i>Disconnect All Pages
+                </button>
+              </div>
+              <% } %>
+
+              <% if (typeof hasFacebookCredentials === 'undefined' || !hasFacebookCredentials) { %>
+              <div class="bg-yellow-900/20 border border-yellow-700/50 rounded-lg p-4">
+                <div class="flex items-start gap-3">
+                  <i class="ti ti-alert-triangle text-yellow-400 text-xl flex-shrink-0 mt-0.5"></i>
+                  <div class="text-sm">
+                    <p class="text-yellow-400 font-medium mb-2">Please save your App credentials before connecting your Facebook Page</p>
+                    <p class="text-gray-400 mb-3">To get your Facebook App credentials:</p>
+                    <ol class="text-gray-400 list-decimal list-inside space-y-1 mb-3">
+                      <li>Open <a href="https://developers.facebook.com/apps" target="_blank" rel="noopener noreferrer" class="text-blue-400 hover:underline">Facebook for Developers</a> and create an app (type: Business)</li>
+                      <li>Add the product <span class="font-mono">Facebook Login</span></li>
+                      <li>Paste the Redirect URI shown on the left into Facebook Login &rarr; Settings &rarr; Valid OAuth Redirect URIs</li>
+                      <li>Request permissions: <span class="font-mono">pages_show_list</span>, <span class="font-mono">pages_read_engagement</span>, <span class="font-mono">pages_manage_posts</span>, <span class="font-mono">publish_video</span></li>
+                      <li>Copy App ID &amp; App Secret from Settings &rarr; Basic into the form on the left</li>
+                    </ol>
+                    <a href="https://developers.facebook.com/apps" target="_blank" rel="noopener noreferrer"
+                      class="inline-flex items-center gap-2 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors text-xs">
+                      <i class="ti ti-external-link"></i>
+                      Open Facebook Developers
+                    </a>
+                  </div>
+                </div>
+              </div>
+              <% } %>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <script>
+        (function () {
+          var CSRF_TOKEN = '<%= csrfToken %>';
+          var MASKED_SECRET = '••••••••••••••••';
+
+          function notify(type, message) {
+            if (typeof showToast === 'function') {
+              showToast(type, message);
+            } else {
+              alert(message);
+            }
+          }
+
+          function fbRequest(url, method) {
+            return fetch(url, {
+              method: method,
+              headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-Token': CSRF_TOKEN
+              }
+            }).then(function (response) {
+              return response.json();
+            });
+          }
+
+          var fbRedirectInput = document.getElementById('fb-redirect-uri');
+          var fbCopyBtn = document.getElementById('fb-copy-redirect-uri');
+
+          if (fbRedirectInput) {
+            fbRedirectInput.value = window.location.protocol + '//' + window.location.host + '/auth/facebook/callback';
+          }
+
+          if (fbCopyBtn && fbRedirectInput) {
+            fbCopyBtn.addEventListener('click', function () {
+              try {
+                if (navigator.clipboard && window.isSecureContext) {
+                  navigator.clipboard.writeText(fbRedirectInput.value);
+                } else {
+                  fbRedirectInput.removeAttribute('readonly');
+                  fbRedirectInput.select();
+                  document.execCommand('copy');
+                  fbRedirectInput.setAttribute('readonly', 'readonly');
+                }
+                notify('success', 'Redirect URI copied to clipboard');
+                fbCopyBtn.innerHTML = '<i class="ti ti-check text-green-400"></i>';
+                setTimeout(function () {
+                  fbCopyBtn.innerHTML = '<i class="ti ti-copy"></i>';
+                }, 2000);
+              } catch (err) {
+                notify('error', 'Failed to copy to clipboard');
+              }
+            });
+          }
+
+          var fbForm = document.getElementById('facebook-credentials-form');
+          var fbAppIdInput = document.getElementById('facebook-app-id');
+          var fbAppSecretInput = document.getElementById('facebook-app-secret');
+          var connectFacebookBtn = document.getElementById('connect-facebook');
+
+          if (fbForm) {
+            fbForm.addEventListener('submit', function (event) {
+              event.preventDefault();
+
+              var appId = fbAppIdInput.value.trim();
+              var appSecret = fbAppSecretInput.value.trim();
+
+              if (!appId) {
+                notify('error', 'Please enter App ID');
+                return;
+              }
+
+              if (!appSecret) {
+                notify('error', 'Please enter App Secret');
+                return;
+              }
+
+              if (appSecret === MASKED_SECRET) {
+                notify('error', 'Please enter a new App Secret to update credentials');
+                return;
+              }
+
+              fetch('/api/settings/facebook-credentials', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-CSRF-Token': CSRF_TOKEN
+                },
+                body: JSON.stringify({ appId: appId, appSecret: appSecret })
+              }).then(function (response) {
+                return response.json();
+              }).then(function (data) {
+                if (data.success) {
+                  notify('success', 'Facebook App credentials saved successfully');
+                  fbAppSecretInput.value = MASKED_SECRET;
+                  if (connectFacebookBtn) {
+                    connectFacebookBtn.disabled = false;
+                  }
+                  setTimeout(function () {
+                    window.location.href = '/settings?activeTab=integration';
+                  }, 1200);
+                } else {
+                  notify('error', data.error || 'Failed to save credentials');
+                }
+              }).catch(function () {
+                notify('error', 'Failed to save credentials');
+              });
+            });
+          }
+
+          if (connectFacebookBtn) {
+            connectFacebookBtn.addEventListener('click', function () {
+              window.location.href = '/auth/facebook';
+            });
+          }
+
+          window.setDefaultFacebookPage = function (pageId) {
+            fbRequest('/api/settings/facebook-page/' + pageId + '/default', 'POST').then(function (data) {
+              if (data.success) {
+                notify('success', 'Default Facebook Page updated');
+                setTimeout(function () {
+                  window.location.href = '/settings?activeTab=integration';
+                }, 800);
+              } else {
+                notify('error', data.error || 'Failed to set default Page');
+              }
+            }).catch(function () {
+              notify('error', 'Failed to set default Page');
+            });
+          };
+
+          window.disconnectFacebookPage = function (pageId, pageName) {
+            if (!confirm('Disconnect Facebook Page "' + pageName + '"?')) {
+              return;
+            }
+
+            fbRequest('/api/settings/facebook-page/' + pageId, 'DELETE').then(function (data) {
+              if (data.success) {
+                notify('success', 'Facebook Page disconnected');
+                setTimeout(function () {
+                  window.location.href = '/settings?activeTab=integration';
+                }, 800);
+              } else {
+                notify('error', data.error || 'Failed to disconnect Page');
+              }
+            }).catch(function () {
+              notify('error', 'Failed to disconnect Page');
+            });
+          };
+
+          var disconnectAllFacebookBtn = document.getElementById('disconnect-all-facebook');
+
+          if (disconnectAllFacebookBtn) {
+            disconnectAllFacebookBtn.addEventListener('click', function () {
+              if (!confirm('Disconnect ALL Facebook Pages?')) {
+                return;
+              }
+
+              fbRequest('/api/settings/facebook-disconnect', 'POST').then(function (data) {
+                if (data.success) {
+                  notify('success', 'All Facebook Pages disconnected');
+                  setTimeout(function () {
+                    window.location.href = '/settings?activeTab=integration';
+                  }, 800);
+                } else {
+                  notify('error', data.error || 'Failed to disconnect Facebook');
+                }
+              }).catch(function () {
+                notify('error', 'Failed to disconnect Facebook');
+              });
+            });
+          }
+        })();
+      </script>
     </div>
 
     <div id="logs-tab" class="settings-content hidden h-[calc(100vh-220px)]">

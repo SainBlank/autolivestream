@@ -1,5 +1,16 @@
 const { v4: uuidv4 } = require('uuid');
 const db = require('./database');
+
+// Kolom SQLite yang menyimpan boolean sebagai 0/1.
+// Dipakai di update() agar nilai true/false dikonversi dengan benar.
+const BOOLEAN_STREAM_COLUMNS = new Set([
+  'youtube_monetization',
+  'is_youtube_api',
+  'is_facebook_api',
+  'is_multi_platform',
+  'use_advanced_settings'
+]);
+
 class Stream {
   static create(streamData) {
     const id = uuidv4();
@@ -30,12 +41,20 @@ class Stream {
       youtube_thumbnail = null,
       youtube_channel_id = null,
       is_youtube_api = false,
-      youtube_monetization = false
+      youtube_monetization = false,
+      stream_mode = 'single',
+      is_multi_platform = false,
+      is_facebook_api = false,
+      facebook_target_id = null,
+      facebook_description = null,
+      facebook_privacy = null
     } = streamData;
     const loop_video_int = loop_video ? 1 : 0;
     const use_advanced_settings_int = use_advanced_settings ? 1 : 0;
     const is_youtube_api_int = is_youtube_api ? 1 : 0;
     const youtube_monetization_int = youtube_monetization ? 1 : 0;
+    const is_multi_platform_int = is_multi_platform ? 1 : 0;
+    const is_facebook_api_int = is_facebook_api ? 1 : 0;
     const final_status = status || (schedule_time ? 'scheduled' : 'offline');
     const status_updated_at = new Date().toISOString();
     return new Promise((resolve, reject) => {
@@ -44,13 +63,15 @@ class Stream {
           id, title, video_id, rtmp_url, stream_key, platform, platform_icon,
           bitrate, resolution, fps, orientation, loop_video,
           schedule_time, end_time, duration, status, status_updated_at, use_advanced_settings, user_id,
-          youtube_broadcast_id, youtube_stream_id, youtube_description, youtube_privacy, youtube_category, youtube_tags, youtube_thumbnail, youtube_channel_id, is_youtube_api, youtube_monetization
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          youtube_broadcast_id, youtube_stream_id, youtube_description, youtube_privacy, youtube_category, youtube_tags, youtube_thumbnail, youtube_channel_id, is_youtube_api, youtube_monetization,
+          stream_mode, is_multi_platform, is_facebook_api, facebook_target_id, facebook_description, facebook_privacy
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id, title, video_id, rtmp_url, stream_key, platform, platform_icon,
           bitrate, resolution, fps, orientation, loop_video_int,
           schedule_time, end_time, duration, final_status, status_updated_at, use_advanced_settings_int, user_id,
-          youtube_broadcast_id, youtube_stream_id, youtube_description, youtube_privacy, youtube_category, youtube_tags, youtube_thumbnail, youtube_channel_id, is_youtube_api_int, youtube_monetization_int
+          youtube_broadcast_id, youtube_stream_id, youtube_description, youtube_privacy, youtube_category, youtube_tags, youtube_thumbnail, youtube_channel_id, is_youtube_api_int, youtube_monetization_int,
+          stream_mode, is_multi_platform_int, is_facebook_api_int, facebook_target_id, facebook_description, facebook_privacy
         ],
         function (err) {
           if (err) {
@@ -74,6 +95,8 @@ class Stream {
           row.use_advanced_settings = row.use_advanced_settings === 1;
           row.is_youtube_api = row.is_youtube_api === 1;
           row.youtube_monetization = row.youtube_monetization === 1;
+          row.is_facebook_api = row.is_facebook_api === 1;
+          row.is_multi_platform = row.is_multi_platform === 1;
         }
         resolve(row);
       });
@@ -98,11 +121,15 @@ class Stream {
                END AS video_type,
                yc.channel_name AS youtube_channel_name,
                yc.channel_thumbnail AS youtube_channel_thumbnail,
-               yc.channel_id AS youtube_channel_external_id
+               yc.channel_id AS youtube_channel_external_id,
+                 ft.target_name AS facebook_target_name,
+                 ft.target_thumbnail AS facebook_target_thumbnail,
+                 ft.target_id AS facebook_target_external_id
         FROM streams s
         LEFT JOIN videos v ON s.video_id = v.id
         LEFT JOIN playlists p ON s.video_id = p.id
         LEFT JOIN youtube_channels yc ON s.youtube_channel_id = yc.id
+        LEFT JOIN facebook_targets ft ON s.facebook_target_id = ft.id
       `;
       const params = [];
       const conditions = [];
@@ -145,6 +172,8 @@ class Stream {
             row.use_advanced_settings = row.use_advanced_settings === 1;
             row.is_youtube_api = row.is_youtube_api === 1;
             row.youtube_monetization = row.youtube_monetization === 1;
+          row.is_facebook_api = row.is_facebook_api === 1;
+          row.is_multi_platform = row.is_multi_platform === 1;
           });
         }
         resolve(rows || []);
@@ -160,6 +189,7 @@ class Stream {
         LEFT JOIN videos v ON s.video_id = v.id
         LEFT JOIN playlists p ON s.video_id = p.id
         LEFT JOIN youtube_channels yc ON s.youtube_channel_id = yc.id
+        LEFT JOIN facebook_targets ft ON s.facebook_target_id = ft.id
       `;
       const params = [];
       const conditions = [];
@@ -208,7 +238,10 @@ class Stream {
                  END AS video_type,
                  yc.channel_name AS youtube_channel_name,
                  yc.channel_thumbnail AS youtube_channel_thumbnail,
-                 yc.channel_id AS youtube_channel_external_id
+                 yc.channel_id AS youtube_channel_external_id,
+                 ft.target_name AS facebook_target_name,
+                 ft.target_thumbnail AS facebook_target_thumbnail,
+                 ft.target_id AS facebook_target_external_id
           ${baseQuery}
           ORDER BY 
             CASE s.status 
@@ -231,6 +264,8 @@ class Stream {
               row.use_advanced_settings = row.use_advanced_settings === 1;
               row.is_youtube_api = row.is_youtube_api === 1;
               row.youtube_monetization = row.youtube_monetization === 1;
+          row.is_facebook_api = row.is_facebook_api === 1;
+          row.is_multi_platform = row.is_multi_platform === 1;
             });
           }
           resolve({
@@ -253,7 +288,7 @@ class Stream {
       if (key === 'loop_video' && typeof value === 'boolean') {
         fields.push(`${key} = ?`);
         values.push(value ? 1 : 0);
-      } else if (key === 'youtube_monetization' && typeof value === 'boolean') {
+      } else if (BOOLEAN_STREAM_COLUMNS.has(key) && typeof value === 'boolean') {
         fields.push(`${key} = ?`);
         values.push(value ? 1 : 0);
       } else {
@@ -409,11 +444,16 @@ class Stream {
                 yc.channel_name AS youtube_channel_name,
                 yc.channel_thumbnail AS youtube_channel_thumbnail,
                 yc.channel_id AS youtube_channel_external_id,
-                yc.subscriber_count AS youtube_subscriber_count
+                yc.subscriber_count AS youtube_subscriber_count,
+                ft.target_name AS facebook_target_name,
+                ft.target_thumbnail AS facebook_target_thumbnail,
+                ft.target_id AS facebook_target_external_id,
+                ft.follower_count AS facebook_follower_count
          FROM streams s
          LEFT JOIN videos v ON s.video_id = v.id
          LEFT JOIN playlists p ON s.video_id = p.id
          LEFT JOIN youtube_channels yc ON s.youtube_channel_id = yc.id
+        LEFT JOIN facebook_targets ft ON s.facebook_target_id = ft.id
          WHERE s.id = ?`,
         [id],
         (err, row) => {
@@ -426,6 +466,8 @@ class Stream {
             row.use_advanced_settings = row.use_advanced_settings === 1;
             row.is_youtube_api = row.is_youtube_api === 1;
             row.youtube_monetization = row.youtube_monetization === 1;
+          row.is_facebook_api = row.is_facebook_api === 1;
+          row.is_multi_platform = row.is_multi_platform === 1;
           }
           resolve(row);
         }
@@ -461,6 +503,8 @@ class Stream {
             row.use_advanced_settings = row.use_advanced_settings === 1;
             row.is_youtube_api = row.is_youtube_api === 1;
             row.youtube_monetization = row.youtube_monetization === 1;
+          row.is_facebook_api = row.is_facebook_api === 1;
+          row.is_multi_platform = row.is_multi_platform === 1;
           });
         }
         resolve(rows || []);

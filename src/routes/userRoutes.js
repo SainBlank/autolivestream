@@ -67,7 +67,22 @@ router.get('/dashboard', isAuthenticated, async (req, res) => {
     const hasYoutubeCredentials = !!(user.youtube_client_id && user.youtube_client_secret);
     const isYoutubeConnected = youtubeChannels.length > 0;
     const defaultChannel = youtubeChannels.find(c => c.is_default) || youtubeChannels[0];
-    
+
+    // Facebook Live: daftar Page yang sudah terhubung (token TIDAK dikirim ke view).
+    const FacebookTarget = require('../models/FacebookTarget');
+    const facebookTargets = await FacebookTarget.findAll(req.session.userId);
+    const hasFacebookCredentials = !!(user.facebook_app_id && user.facebook_app_secret);
+    const isFacebookConnected = facebookTargets.length > 0;
+    const defaultFacebookTarget = facebookTargets.find(t => t.is_default) || facebookTargets[0];
+    const facebookPages = facebookTargets.map(target => ({
+      id: target.id,
+      target_id: target.target_id,
+      target_name: target.target_name,
+      target_thumbnail: target.target_thumbnail,
+      follower_count: target.follower_count,
+      is_default: !!target.is_default
+    }));
+
     const initialStreamsData = await Stream.findAllPaginated(req.session.userId, {
       page: 1,
       limit: 10,
@@ -84,6 +99,12 @@ router.get('/dashboard', isAuthenticated, async (req, res) => {
       youtubeChannelThumbnail: defaultChannel?.channel_thumbnail || '',
       youtubeSubscriberCount: defaultChannel?.subscriber_count || '0',
       hasYoutubeCredentials: hasYoutubeCredentials,
+      facebookConnected: isFacebookConnected,
+      facebookPages: facebookPages,
+      facebookPageName: defaultFacebookTarget?.target_name || '',
+      facebookPageThumbnail: defaultFacebookTarget?.target_thumbnail || '',
+      facebookFollowerCount: defaultFacebookTarget?.follower_count || '0',
+      hasFacebookCredentials: hasFacebookCredentials,
       initialStreams: JSON.stringify(initialStreamsData.streams),
       initialPagination: JSON.stringify(initialStreamsData.pagination)
     });
@@ -340,6 +361,21 @@ router.get('/settings', isAuthenticated, async (req, res) => {
     const isYoutubeConnected = youtubeChannels.length > 0;
     const defaultChannel = youtubeChannels.find(c => c.is_default) || youtubeChannels[0];
     
+    // Facebook Live integration state untuk tab Integration.
+    const FacebookTarget = require('../models/FacebookTarget');
+    const hasFacebookCredentials = !!(user.facebook_app_id && user.facebook_app_secret);
+    const facebookTargets = await FacebookTarget.findAll(req.session.userId);
+    const isFacebookConnected = facebookTargets.length > 0;
+    const defaultFacebookTarget = facebookTargets.find(t => t.is_default) || facebookTargets[0];
+    const facebookPages = facebookTargets.map(target => ({
+      id: target.id,
+      target_id: target.target_id,
+      target_name: target.target_name,
+      target_thumbnail: target.target_thumbnail,
+      follower_count: target.follower_count,
+      is_default: !!target.is_default
+    }));
+
     const recaptchaSettings = await AppSettings.getRecaptchaSettings();
     
     res.render('settings', {
@@ -355,6 +391,14 @@ router.get('/settings', isAuthenticated, async (req, res) => {
       youtubeChannelThumbnail: defaultChannel?.channel_thumbnail || '',
       youtubeSubscriberCount: defaultChannel?.subscriber_count || '0',
       hasYoutubeCredentials: hasYoutubeCredentials,
+      facebookAppId: user.facebook_app_id || '',
+      facebookAppSecret: user.facebook_app_secret ? '••••••••••••••••' : '',
+      facebookConnected: isFacebookConnected,
+      facebookPages: facebookPages,
+      facebookPageName: defaultFacebookTarget?.target_name || '',
+      facebookPageThumbnail: defaultFacebookTarget?.target_thumbnail || '',
+      facebookFollowerCount: defaultFacebookTarget?.follower_count || '0',
+      hasFacebookCredentials: hasFacebookCredentials,
       recaptchaSiteKey: recaptchaSettings.siteKey || '',
       recaptchaSecretKey: recaptchaSettings.secretKey ? '����������������' : '',
       hasRecaptchaKeys: recaptchaSettings.hasKeys,

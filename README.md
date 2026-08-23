@@ -258,6 +258,49 @@ Data akan tersimpan secara otomatis di:
 docker-compose exec app node reset-password.js
 ```
 
+## 📡 Facebook Live & Multi-Platform (v2.2)
+
+Selain YouTube, aplikasi kini bisa live otomatis ke **Facebook Page** dan ke **kedua platform sekaligus**.
+
+| Mode di modal New Stream | Fungsi |
+|--------------------------|--------|
+| **Manual (RTMP)** | Isi RTMP URL + stream key sendiri (semua platform) |
+| **YouTube API** | Broadcast YouTube dibuat otomatis |
+| **Facebook API** | Live video Facebook Page dibuat otomatis |
+| **Both (Simulcast)** | Satu encode dikirim ke YouTube + Facebook sekaligus |
+
+### Langkah singkat
+
+1. Tambahkan `BASE_URL` di file `.env` sesuai alamat publik aplikasi:
+
+   ```env
+   BASE_URL=https://live.domainku.com
+   FB_GRAPH_VERSION=v21.0
+   ```
+
+2. Buat Facebook App di [developers.facebook.com](https://developers.facebook.com/apps), tambahkan produk **Facebook Login**, dan isi **Valid OAuth Redirect URI** dengan:
+
+   ```
+   https://live.domainku.com/auth/facebook/callback
+   ```
+
+   (Nilai persisnya bisa langsung dicopy dari halaman **Settings → Integration**.)
+
+3. Di aplikasi: **Settings → Integration → Facebook Integration** → simpan **App ID** & **App Secret** → klik **Add Page** → pilih Page.
+
+4. Buat stream baru dan pilih mode **Facebook API** atau **Both (Simulcast)**.
+
+### Catatan penting
+
+- Bitrate dibatasi otomatis maksimal **4000 kbps** saat Facebook menjadi tujuan, agar stream stabil.
+- Video hanya di-encode **sekali** untuk simulcast, jadi beban CPU tetap ringan.
+- Live video Facebook otomatis diakhiri saat stream dihentikan.
+- Migrasi database berjalan otomatis, aditif, dan aman untuk database lama (tetap disarankan backup `db/streamfire.db`).
+
+📖 Panduan lengkap beserta troubleshooting: **[docs/FACEBOOK_SETUP.md](docs/FACEBOOK_SETUP.md)**
+
+---
+
 ## 🪛 Troubleshooting
 
 ### Permission Error
