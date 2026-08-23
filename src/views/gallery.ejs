@@ -763,6 +763,15 @@
       });
     }
 
+    // Gabungkan error + details + code dari backend supaya penyebab asli terlihat
+    function describeApiError(data, fallback) {
+      var parts = [];
+      if (data && data.error) parts.push(data.error);
+      if (data && data.details && data.details !== data.error) parts.push(data.details);
+      if (data && data.code) parts.push('[' + data.code + ']');
+      return parts.length > 0 ? parts.join(' - ') : fallback;
+    }
+
     async function readJson(res, tag) {
       var raw = await res.text();
       try {
@@ -791,7 +800,7 @@
       });
 
       var initData = await readJson(initRes, 'init');
-      if (!initData.success) throw new Error(initData.error || 'Gagal memulai upload');
+      if (!initData.success) throw new Error(describeApiError(initData, 'Gagal memulai upload'));
 
       var chunkSize = initData.chunkSize || CHUNK_SIZE;
       totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
@@ -830,7 +839,7 @@
               uploaded = chunkData.uploadedChunks || uploaded;
               break;
             }
-            lastError = chunkData.error || lastError;
+            lastError = describeApiError(chunkData, lastError);
             throw new Error(lastError);
           } catch (chunkError) {
             lastError = chunkError.message || lastError;
@@ -856,7 +865,7 @@
       });
 
       var doneData = await readJson(doneRes, 'complete');
-      if (!doneData.success) throw new Error(doneData.error || 'Gagal menyelesaikan upload');
+      if (!doneData.success) throw new Error(describeApiError(doneData, 'Gagal menyelesaikan upload'));
       return { success: true };
     }
 

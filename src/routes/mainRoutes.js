@@ -352,7 +352,12 @@ router.post('/api/videos/chunk/init', isAuthenticated, async (req, res) => {
     });
   } catch (error) {
     console.error('Chunk init error:', error);
-    res.status(500).json({ success: false, error: 'Failed to initialize upload' });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to initialize upload',
+      details: error.message,
+      code: error.code || null
+    });
   }
 });
 
@@ -374,7 +379,12 @@ router.post('/api/videos/chunk/upload', isAuthenticated, express.raw({ type: 'ap
     res.json({ success: true, ...result });
   } catch (error) {
     console.error('Chunk upload error:', error);
-    res.status(500).json({ success: false, error: 'Failed to upload chunk' });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to upload chunk',
+      details: error.message,
+      code: error.code || null
+    });
   }
 });
 
